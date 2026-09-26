@@ -1,0 +1,28 @@
+[package]
+name = "rawdinal"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "GPL-3.0-only"
+publish = false
+
+[workspace]
+members = ["ffi"]
+resolver = "3"
+
+[lib]
+crate-type = ["rlib"]
+
+[[bin]]
+name = "rawdinal-inspect"
+path = "src/bin/inspect.rs"
+
+[[bench]]
+name = "decode"
+harness = false
+
+[profile.release]
+overflow-checks = true
+
+[lints.rust]
+unsafe_code = "forbid"
