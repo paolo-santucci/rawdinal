@@ -1,18 +1,24 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // Copyright (C) 2026 Paolo SANTUCCI
 
-//! Native, bounded decoding of selected Sigma X3F sensor planes and CAMF data.
-//! Sensor planes are not RGB; rendering requires camera calibration and reconstruction.
+//! Native support for selected X3F sensor planes and Apple ProRAW DNG images.
 
 mod camf;
 mod container;
+mod dng;
 mod entropy;
 pub mod experimental;
+mod lossless_jpeg;
 mod photo;
+mod probe;
 mod reader;
 
 pub use camf::{Calibration, Entry, Matrix};
 pub use container::{Plane, SensorFormat, SensorImage, X3f};
+pub use dng::{Dng, LinearRawImage, LinearRawProcessing, LinearRawProcessingState};
+pub use probe::{
+    ByteOrder, ContainerProbe, DecodeError, DecodeLimits, DngFacts, ProbeResult, X3fFacts, probe,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Error(pub String);
