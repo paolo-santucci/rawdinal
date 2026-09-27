@@ -39,6 +39,16 @@ set_target_properties(rawdinal PROPERTIES
 add_dependencies(rawdinal rawdinal_build)
 target_link_libraries(rawdinal INTERFACE ${CMAKE_DL_LIBS} pthread m)
 
+if(CMAKE_SOURCE_DIR STREQUAL PROJECT_SOURCE_DIR)
+  include(CTest)
+  if(BUILD_TESTING)
+    add_executable(rawdinal_sensor_v1_abi_test tests/sensor_v1_abi.c)
+    target_compile_features(rawdinal_sensor_v1_abi_test PRIVATE c_std_11)
+    target_link_libraries(rawdinal_sensor_v1_abi_test PRIVATE rawdinal)
+    add_test(NAME rawdinal_sensor_v1_abi COMMAND rawdinal_sensor_v1_abi_test)
+  endif()
+endif()
+
 if(RAWDINAL_INSTALL)
   install(FILES "${RAWDINAL_ARCHIVE}" DESTINATION "${CMAKE_INSTALL_LIBDIR}")
   install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/include/rawdinal.h"
