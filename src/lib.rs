@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // Copyright (C) 2026 Paolo SANTUCCI
 
-//! Native, bounded decoding of Sigma sd Quattro X3F sensor planes and CAMF data.
+//! Native, bounded decoding of selected Sigma X3F sensor planes and CAMF data.
 //! Sensor planes are not RGB; rendering requires camera calibration and reconstruction.
 
 mod camf;
@@ -12,7 +12,7 @@ mod photo;
 mod reader;
 
 pub use camf::{Calibration, Entry, Matrix};
-pub use container::{Plane, SensorImage, X3f};
+pub use container::{Plane, SensorFormat, SensorImage, X3f};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Error(pub String);

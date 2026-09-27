@@ -21,10 +21,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .read_to_end(&mut bytes)?;
     let file = X3f::parse(&bytes)?;
     let calibration = file.calibration()?;
-    eprintln!(
-        "Selected white balance: {}",
-        file.white_balance(&calibration)?
-    );
+    if let Ok(white_balance) = file.white_balance(&calibration) {
+        eprintln!("Selected white balance: {white_balance}");
+    }
     eprintln!(
         "CAMF: {} entries, {} decoded bytes, {:.3}s",
         calibration.entries.len(),

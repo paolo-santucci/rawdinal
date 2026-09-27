@@ -16,6 +16,17 @@ pub struct X3f<'a> {
     raw: Reader<'a>,
     camf: Reader<'a>,
     jpeg: Option<Reader<'a>>,
+    version: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SensorFormat {
+    /// X3F 3.0 or 3.1 with TRUE format `0x1e`.
+    Merrill,
+    /// X3F 4.1 with TRUE format `0x23`.
+    Quattro,
+    /// X3F 4.2 with TRUE format `0x25`.
+    SdQuattro,
 }
 
 #[derive(Debug)]
@@ -28,6 +39,10 @@ pub struct Plane {
 #[derive(Debug)]
 pub struct SensorImage {
     /// Physical bottom, middle and top layers, in that order. These are not RGB.
+    ///
+    /// Plane dimensions preserve the full encoded sensor layout. In particular, a Quattro top
+    /// layer can be wider than the nominal image dimensions. No crop or active-area interpretation
+    /// is applied.
     pub layers: [Plane; 3],
 }
 
@@ -38,8 +53,12 @@ impl<'a> X3f<'a> {
         }
         let file = Reader(bytes);
         file.signature(0, b"FOVb")?;
-        if file.u32(4)? != 0x0004_0002 {
-            return Err(invalid("only X3F 4.2 is currently supported"));
+        let version = file.u32(4)?;
+        if !matches!(
+            version,
+            0x0003_0000 | 0x0003_0001 | 0x0004_0001 | 0x0004_0002
+        ) {
+            return Err(invalid("unsupported X3F version"));
         }
         let directory_offset = file.size(bytes.len() - 4)?;
         if directory_offset < 40 || directory_offset >= bytes.len() - 4 {
@@ -83,8 +102,8 @@ impl<'a> X3f<'a> {
                     }
                     if section.u32(8)? == 2 && section.u32(12)? == 0x12 {
                         section.bytes(0, 28)?;
-                        if jpeg.replace(Reader(&section.0[28..])).is_some() {
-                            return Err(invalid("multiple JPEG sections"));
+                        if jpeg.is_none() {
+                            jpeg = Some(Reader(&section.0[28..]));
                         }
                     }
                 }
@@ -99,11 +118,32 @@ impl<'a> X3f<'a> {
         }
         let raw = raw.ok_or_else(|| invalid("missing RAW section"))?;
         let camf = camf.ok_or_else(|| invalid("missing CAMF section"))?;
-        Ok(Self { raw, camf, jpeg })
+        Ok(Self {
+            raw,
+            camf,
+            jpeg,
+            version,
+        })
     }
 
     pub fn calibration(&self) -> Result<Calibration> {
-        Calibration::decode(self.camf)
+        Calibration::decode(self.validated_camf()?)
+    }
+
+    pub fn sensor_format(&self) -> Result<SensorFormat> {
+        match (self.version, self.raw.u32(12)?) {
+            (0x0003_0000 | 0x0003_0001, 0x1e) => Ok(SensorFormat::Merrill),
+            (0x0004_0001, 0x23) => Ok(SensorFormat::Quattro),
+            (0x0004_0002, 0x25) => Ok(SensorFormat::SdQuattro),
+            _ => Err(invalid(
+                "unsupported X3F version and TRUE format combination",
+            )),
+        }
+    }
+
+    /// Decompresses the CAMF payload without interpreting its entries.
+    pub fn camf_bytes(&self) -> Result<Vec<u8>> {
+        crate::camf::decompress(self.validated_camf()?)
     }
 
     /// Borrowed TIFF/EXIF bytes from the JPEG preview; no preview pixels are decoded.
@@ -152,28 +192,38 @@ impl<'a> X3f<'a> {
     }
 
     pub fn decode(&self) -> Result<SensorImage> {
-        if self.raw.u32(4)? != 0x0002_0000 || self.raw.u32(12)? != 0x25 {
-            return Err(invalid(
-                "only sd Quattro TRUE format 0x25 is currently supported",
-            ));
+        if self.raw.u32(4)? != 0x0002_0000 {
+            return Err(invalid("unsupported RAW section version"));
         }
-        let dimensions: Vec<_> = (0..3)
-            .map(|channel| {
-                Ok((
-                    usize::from(self.raw.u16(28 + 4 * channel)?),
-                    usize::from(self.raw.u16(30 + 4 * channel)?),
-                ))
-            })
-            .collect::<Result<_>>()?;
-        if dimensions[0] != dimensions[1]
-            || dimensions[2] != (2 * dimensions[0].0, 2 * dimensions[0].1)
-            || dimensions[2] != (self.raw.size(16)?, self.raw.size(20)?)
-        {
-            return Err(invalid("unsupported Quattro layer geometry"));
-        }
-        let mut offset = 48;
+        let image_dimensions = (self.raw.size(16)?, self.raw.size(20)?);
+        let format = self.sensor_format()?;
+        let (dimensions, seeds_offset, mut offset, has_quattro_marker) = match format {
+            SensorFormat::Merrill => ([image_dimensions; 3], 28, 36, false),
+            SensorFormat::Quattro | SensorFormat::SdQuattro => {
+                let encoded = [
+                    (
+                        usize::from(self.raw.u16(28)?),
+                        usize::from(self.raw.u16(30)?),
+                    ),
+                    (
+                        usize::from(self.raw.u16(32)?),
+                        usize::from(self.raw.u16(34)?),
+                    ),
+                    (
+                        usize::from(self.raw.u16(36)?),
+                        usize::from(self.raw.u16(38)?),
+                    ),
+                ];
+                (encoded, 40, 48, true)
+            }
+        };
+        validate_geometry(format, dimensions, image_dimensions)?;
         let book = Codebook::parse(self.raw, &mut offset)?;
-        offset += 4;
+        if has_quattro_marker {
+            offset = offset
+                .checked_add(4)
+                .ok_or_else(|| invalid("RAW header offset overflow"))?;
+        }
         let lengths = [
             self.raw.size(offset)?,
             self.raw.size(offset + 4)?,
@@ -183,7 +233,7 @@ impl<'a> X3f<'a> {
         let mut layers = Vec::new();
         for (channel, &(width, height)) in dimensions.iter().enumerate() {
             let data = self.raw.bytes(offset, lengths[channel])?;
-            let seed = self.raw.u16(40 + 2 * channel)?;
+            let seed = self.raw.u16(seeds_offset + 2 * channel)?;
             layers.push(decode_plane(data, &book, (width, height), seed)?);
             offset = offset
                 .checked_add((lengths[channel] + 15) & !15)
@@ -194,6 +244,33 @@ impl<'a> X3f<'a> {
             .map_err(|_| invalid("invalid layer count"))?;
         Ok(SensorImage { layers })
     }
+
+    fn validated_camf(&self) -> Result<Reader<'a>> {
+        let expected_type = match self.sensor_format()? {
+            SensorFormat::Merrill => 4,
+            SensorFormat::Quattro | SensorFormat::SdQuattro => 5,
+        };
+        if self.camf.u32(8)? != expected_type {
+            return Err(invalid("unsupported CAMF type for sensor format"));
+        }
+        Ok(self.camf)
+    }
+}
+
+fn validate_geometry(
+    format: SensorFormat,
+    encoded: [(usize, usize); 3],
+    image: (usize, usize),
+) -> Result<()> {
+    let expected = match format {
+        SensorFormat::Merrill => ([(4928, 3264); 3], (4928, 3264)),
+        SensorFormat::Quattro => ([(2944, 1836), (2944, 1836), (6272, 3672)], (5888, 3672)),
+        SensorFormat::SdQuattro => ([(2944, 1888), (2944, 1888), (5888, 3776)], (5888, 3776)),
+    };
+    if (encoded, image) != expected {
+        return Err(invalid("unsupported Quattro layer geometry"));
+    }
+    Ok(())
 }
 
 fn decode_plane(
@@ -205,17 +282,20 @@ fn decode_plane(
     let count = width
         .checked_mul(height)
         .ok_or_else(|| invalid("plane dimensions overflow"))?;
-    if width < 2 || height < 2 || count > MAX_PLANE_SAMPLES || count > bytes.len() * 8 {
+    if width < 2 || height < 2 || count > MAX_PLANE_SAMPLES || count > bytes.len().saturating_mul(8)
+    {
         return Err(invalid("plane dimensions outside supported limits"));
     }
     let mut samples = zeroed(count)?;
     let mut bits = Bits::new(bytes);
     let mut row_start = [[i32::from(seed); 2]; 2];
-    for (y, row) in samples.chunks_exact_mut(width).enumerate() {
+    for y in 0..height {
         let mut previous = row_start[y % 2];
-        for (x, sample) in row.iter_mut().enumerate() {
-            let value = previous[x % 2] + book.difference(&mut bits)?;
-            *sample = u16::try_from(value)
+        for x in 0..width {
+            let value = previous[x % 2]
+                .checked_add(book.difference(&mut bits)?)
+                .ok_or_else(|| invalid("sensor predictor overflow"))?;
+            samples[y * width + x] = u16::try_from(value)
                 .map_err(|_| invalid("sensor predictor outside 16-bit range"))?;
             previous[x % 2] = value;
             if x < 2 {
@@ -250,6 +330,41 @@ mod tests {
     fn rejects_predictor_overflow() {
         let book = Codebook::parse(Reader(&[1, 0, 1, 128, 0, 0]), &mut 0).unwrap();
         assert!(decode_plane(&[255; 2], &book, (2, 2), 65535).is_err());
+    }
+
+    #[test]
+    fn rejects_predictors_outside_the_sensor_sample_range() {
+        let book = Codebook::parse(Reader(&[1, 0, 1, 128, 0, 0]), &mut 0).unwrap();
+        assert!(decode_plane(&[255], &book, (2, 2), 65535).is_err());
+    }
+
+    #[test]
+    fn accepts_only_observed_sensor_geometries() {
+        assert!(validate_geometry(SensorFormat::Merrill, [(4928, 3264); 3], (4928, 3264)).is_ok());
+        assert!(
+            validate_geometry(
+                SensorFormat::Quattro,
+                [(2944, 1836), (2944, 1836), (6272, 3672)],
+                (5888, 3672)
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_geometry(
+                SensorFormat::SdQuattro,
+                [(2944, 1888), (2944, 1888), (5888, 3776)],
+                (5888, 3776)
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_geometry(
+                SensorFormat::Quattro,
+                [(2944, 1836), (2944, 1836), (5888, 3672)],
+                (5888, 3672)
+            )
+            .is_err()
+        );
     }
 
     #[test]

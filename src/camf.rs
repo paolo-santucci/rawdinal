@@ -11,6 +11,7 @@ use crate::{
 use std::collections::BTreeMap;
 
 const MAX_CALIBRATION_BYTES: usize = 32 * 1024 * 1024;
+const MAX_PROPERTY_STRING_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Debug)]
 pub struct Matrix {
@@ -33,31 +34,7 @@ pub struct Calibration {
 
 impl Calibration {
     pub(crate) fn decode(section: Reader<'_>) -> Result<Self> {
-        if section.u32(4)? != 0x0002_0000 || section.u32(8)? != 5 {
-            return Err(invalid("only type-5 CAMF is currently supported"));
-        }
-        let size = section.size(12)?;
-        if size == 0 || size > MAX_CALIBRATION_BYTES {
-            return Err(invalid("invalid CAMF size"));
-        }
-        section.bytes(0, 28)?;
-        let data = Reader(&section.0[28..]);
-        let mut offset = 0;
-        let book = Codebook::parse(data, &mut offset)?;
-        if offset > 28 {
-            return Err(invalid("CAMF codebook overlaps stream header"));
-        }
-        let stream = data.bytes(32, data.size(28)?)?;
-        if size > stream.len() * 8 {
-            return Err(invalid("CAMF size exceeds entropy capacity"));
-        }
-        let mut bits = Bits::new(stream);
-        let mut decoded: Vec<u8> = zeroed(size)?;
-        let mut accumulator = section.u32(16)?;
-        for byte in &mut decoded {
-            accumulator = accumulator.wrapping_add_signed(book.difference(&mut bits)?);
-            *byte = accumulator as u8;
-        }
+        let decoded = decompress(section)?;
         let entries = Self::parse_entries(&decoded)?;
         Ok(Self { entries, decoded })
     }
@@ -69,6 +46,7 @@ impl Calibration {
     fn parse_entries(bytes: &[u8]) -> Result<BTreeMap<String, Entry>> {
         let mut entries = BTreeMap::new();
         let mut offset = 0;
+        let mut remaining_property_strings = MAX_PROPERTY_STRING_BYTES;
         while offset < bytes.len() {
             if entries.len() >= 4096 {
                 return Err(invalid("too many calibration entries"));
@@ -92,7 +70,11 @@ impl Calibration {
                         std::str::from_utf8(text).map_err(|_| invalid("invalid CAMF text"))?;
                     Entry::Text(text.trim_end_matches('\0').to_owned())
                 }
-                b"CMbP" => Entry::Properties(parse_properties(entry, value_offset)?),
+                b"CMbP" => Entry::Properties(parse_properties(
+                    entry,
+                    value_offset,
+                    &mut remaining_property_strings,
+                )?),
                 b"CMbM" => Entry::Matrix(parse_matrix(entry, value_offset)?),
                 _ => return Err(invalid("unknown CAMF entry type")),
             };
@@ -130,7 +112,127 @@ impl Calibration {
     }
 }
 
-fn parse_properties(entry: Reader<'_>, offset: usize) -> Result<BTreeMap<String, String>> {
+pub(crate) fn decompress(section: Reader<'_>) -> Result<Vec<u8>> {
+    if section.u32(4)? != 0x0002_0000 {
+        return Err(invalid("unsupported CAMF section version"));
+    }
+    match section.u32(8)? {
+        4 => decompress_type4(section),
+        5 => decompress_type5(section),
+        _ => Err(invalid("unsupported CAMF type")),
+    }
+}
+
+fn decompress_type5(section: Reader<'_>) -> Result<Vec<u8>> {
+    let size = section.size(12)?;
+    if size == 0 || size > MAX_CALIBRATION_BYTES {
+        return Err(invalid("invalid CAMF size"));
+    }
+    section.bytes(0, 28)?;
+    let data = Reader(&section.0[28..]);
+    let mut offset = 0;
+    let book = Codebook::parse(data, &mut offset)?;
+    if offset > 28 {
+        return Err(invalid("CAMF codebook overlaps stream header"));
+    }
+    let stream = data.bytes(32, data.size(28)?)?;
+    if size > stream.len() * 8 {
+        return Err(invalid("CAMF size exceeds entropy capacity"));
+    }
+    let mut bits = Bits::new(stream);
+    let mut decoded: Vec<u8> = zeroed(size)?;
+    let mut accumulator = section.u32(16)?;
+    for byte in &mut decoded {
+        accumulator = accumulator.wrapping_add_signed(book.difference(&mut bits)?);
+        *byte = accumulator as u8;
+    }
+    Ok(decoded)
+}
+
+fn decompress_type4(section: Reader<'_>) -> Result<Vec<u8>> {
+    let size = section.size(12)?;
+    let seed = i32::try_from(section.u32(16)?).map_err(|_| invalid("invalid CAMF decode bias"))?;
+    let block_size = section.size(20)?;
+    let block_count = section.size(24)?;
+    if size == 0 || size > MAX_CALIBRATION_BYTES {
+        return Err(invalid("invalid CAMF size"));
+    }
+    let values = size
+        .checked_mul(2)
+        .and_then(|size| size.checked_add(2))
+        .map(|size| size / 3)
+        .ok_or_else(|| invalid("CAMF value count overflow"))?;
+    let blocks = block_size
+        .checked_mul(block_count)
+        .ok_or_else(|| invalid("CAMF block dimensions overflow"))?;
+    if block_size < 2 || block_count == 0 || blocks < values || blocks > MAX_CALIBRATION_BYTES * 2 {
+        return Err(invalid("CAMF block dimensions outside supported limits"));
+    }
+    section.bytes(0, 60)?;
+    let data = Reader(&section.0[28..]);
+    let mut offset = 0;
+    let book = Codebook::parse(data, &mut offset)?;
+    if offset > 28 {
+        return Err(invalid("CAMF codebook overlaps stream header"));
+    }
+    let stream = data.bytes(32, data.size(28)?)?;
+    if values > stream.len().saturating_mul(8) {
+        return Err(invalid("CAMF size exceeds entropy capacity"));
+    }
+    let mut decoded = zeroed(size)?;
+    let mut bits = Bits::new(stream);
+    let mut row_start = [[seed; 2]; 2];
+    let mut index = 0;
+    for row in 0..block_count {
+        let mut previous = row_start[row % 2];
+        for column in 0..block_size {
+            if index == values {
+                return Ok(decoded);
+            }
+            let parity = column % 2;
+            let value = previous[parity]
+                .checked_add(book.difference(&mut bits)?)
+                .ok_or_else(|| invalid("CAMF predictor overflow"))?;
+            if !(0..=0x0fff).contains(&value) {
+                return Err(invalid("CAMF predictor outside 12-bit range"));
+            }
+            previous[parity] = value;
+            if column < 2 {
+                row_start[row % 2][parity] = value;
+            }
+            pack_camf_value(&mut decoded, index, value as u16);
+            index += 1;
+        }
+    }
+    if index == values {
+        Ok(decoded)
+    } else {
+        Err(invalid("CAMF blocks ended before declared output"))
+    }
+}
+
+fn pack_camf_value(decoded: &mut [u8], index: usize, value: u16) {
+    let offset = 3 * (index / 2);
+    if index % 2 == 0 {
+        decoded[offset] = (value >> 4) as u8;
+        if let Some(byte) = decoded.get_mut(offset + 1) {
+            *byte = (value as u8 & 0x0f) << 4;
+        }
+    } else {
+        if let Some(byte) = decoded.get_mut(offset + 1) {
+            *byte |= (value >> 8) as u8;
+        }
+        if let Some(byte) = decoded.get_mut(offset + 2) {
+            *byte = value as u8;
+        }
+    }
+}
+
+fn parse_properties(
+    entry: Reader<'_>,
+    offset: usize,
+    remaining_strings: &mut usize,
+) -> Result<BTreeMap<String, String>> {
     let count = entry.size(offset)?;
     let strings = entry.size(offset + 4)?;
     if count > 4096 {
@@ -144,13 +246,28 @@ fn parse_properties(entry: Reader<'_>, offset: usize) -> Result<BTreeMap<String,
         let value_offset = strings
             .checked_add(entry.size(offset + 12 + 8 * index)?)
             .ok_or_else(|| invalid("property offset overflow"))?;
-        let name = entry.string(name_offset)?.to_owned();
-        let value = entry.string(value_offset)?.to_owned();
+        let name = property_string(entry, name_offset, &mut *remaining_strings)?.to_owned();
+        let value = property_string(entry, value_offset, &mut *remaining_strings)?.to_owned();
         if properties.insert(name, value).is_some() {
             return Err(invalid("duplicate calibration property"));
         }
     }
     Ok(properties)
+}
+
+fn property_string<'a>(entry: Reader<'a>, offset: usize, remaining: &mut usize) -> Result<&'a str> {
+    let bytes = entry
+        .0
+        .get(offset..)
+        .ok_or_else(|| invalid("invalid string offset"))?;
+    let bounded = &bytes[..bytes.len().min(*remaining)];
+    let length = bounded
+        .iter()
+        .position(|&byte| byte == 0)
+        .ok_or_else(|| invalid("calibration property strings exceed supported limits"))?;
+    let scanned = length + 1;
+    *remaining -= scanned;
+    std::str::from_utf8(&bounded[..length]).map_err(|_| invalid("invalid UTF-8 metadata"))
 }
 
 fn parse_matrix(entry: Reader<'_>, offset: usize) -> Result<Matrix> {
@@ -235,7 +352,42 @@ mod tests {
         let mut entry = vec![0; 40];
         entry[20..24].copy_from_slice(&1u32.to_le_bytes());
         entry[24..28].copy_from_slice(&u32::MAX.to_le_bytes());
-        assert!(parse_properties(Reader(&entry), 20).is_err());
+        let mut budget = MAX_PROPERTY_STRING_BYTES;
+        assert!(parse_properties(Reader(&entry), 20, &mut budget).is_err());
+    }
+
+    #[test]
+    fn rejects_aliased_property_strings_over_the_aggregate_budget() {
+        let mut entry = vec![0; 40 + 1024 * 1024 + 1];
+        entry[20..24].copy_from_slice(&2u32.to_le_bytes());
+        entry[24..28].copy_from_slice(&40u32.to_le_bytes());
+        let end = entry.len() - 1;
+        entry[40..end].fill(b'a');
+        let mut budget = MAX_PROPERTY_STRING_BYTES;
+        assert!(parse_properties(Reader(&entry), 20, &mut budget).is_err());
+    }
+
+    fn property_entry(name: &[u8], string_bytes: usize) -> Vec<u8> {
+        let value_offset = 20 + name.len() + 1;
+        let strings = value_offset + 16;
+        let mut entry = vec![0; strings + string_bytes + 1];
+        entry[..4].copy_from_slice(b"CMbP");
+        entry[12..16].copy_from_slice(&20u32.to_le_bytes());
+        entry[16..20].copy_from_slice(&(value_offset as u32).to_le_bytes());
+        entry[20..20 + name.len()].copy_from_slice(name);
+        entry[value_offset..value_offset + 4].copy_from_slice(&1u32.to_le_bytes());
+        entry[value_offset + 4..value_offset + 8].copy_from_slice(&(strings as u32).to_le_bytes());
+        entry[strings..strings + string_bytes].fill(b'a');
+        let size = entry.len() as u32;
+        entry[8..12].copy_from_slice(&size.to_le_bytes());
+        entry
+    }
+
+    #[test]
+    fn rejects_property_strings_that_exceed_the_global_calibration_budget() {
+        let mut entries = property_entry(b"First", 1_500_000);
+        entries.extend(property_entry(b"Second", 1_500_000));
+        assert!(Calibration::parse_entries(&entries).is_err());
     }
 
     #[test]
@@ -248,5 +400,52 @@ mod tests {
         for size in 0..28 {
             assert!(Calibration::decode(Reader(&vec![0; size])).is_err());
         }
+    }
+
+    fn type4_section(size: usize) -> Vec<u8> {
+        let mut section = vec![0; 60];
+        section[..4].copy_from_slice(b"SECc");
+        section[4..8].copy_from_slice(&0x20000u32.to_le_bytes());
+        section[8..12].copy_from_slice(&4u32.to_le_bytes());
+        section[12..16].copy_from_slice(&(size as u32).to_le_bytes());
+        section[16..20].copy_from_slice(&0x123u32.to_le_bytes());
+        section[20..24].copy_from_slice(&3u32.to_le_bytes());
+        section[24..28].copy_from_slice(&1u32.to_le_bytes());
+        section[28..32].copy_from_slice(&[1, 0, 0, 0]);
+        section[56..60].copy_from_slice(&1u32.to_le_bytes());
+        section.push(0);
+        section
+    }
+
+    #[test]
+    fn decodes_type4_twelve_bit_packing() {
+        assert_eq!(
+            decompress(Reader(&type4_section(3))).unwrap(),
+            [0x12, 0x31, 0x23]
+        );
+    }
+
+    #[test]
+    fn type4_packs_partial_final_values_and_accepts_exact_grids() {
+        assert_eq!(decompress(Reader(&type4_section(1))).unwrap(), [0x12]);
+        assert_eq!(decompress(Reader(&type4_section(2))).unwrap(), [0x12, 0x31]);
+        assert_eq!(
+            decompress(Reader(&type4_section(3))).unwrap(),
+            [0x12, 0x31, 0x23]
+        );
+        assert_eq!(
+            decompress(Reader(&type4_section(4))).unwrap(),
+            [0x12, 0x31, 0x23, 0x12]
+        );
+    }
+
+    #[test]
+    fn type4_rejects_truncated_stream_and_invalid_blocks() {
+        let mut truncated = type4_section(3);
+        truncated.pop();
+        assert!(decompress(Reader(&truncated)).is_err());
+        let mut blocks = type4_section(3);
+        blocks[20..24].copy_from_slice(&1u32.to_le_bytes());
+        assert!(decompress(Reader(&blocks)).is_err());
     }
 }
