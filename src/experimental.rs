@@ -396,20 +396,7 @@ fn repair_pixels(layer: &mut Layer, marked: &[bool]) -> Result<()> {
         let mut weight = 0.0;
         let mut influence = 0;
         for radius in 1..=8 {
-            for ny in y.saturating_sub(radius)..=(y + radius).min(layer.height - 1) {
-                for nx in x.saturating_sub(radius)..=(x + radius).min(layer.width - 1) {
-                    if nx.abs_diff(x).max(ny.abs_diff(y)) != radius || marked[ny * layer.width + nx]
-                    {
-                        continue;
-                    }
-                    let w = 1.0 / ((nx as f32 - x as f32).powi(2) + (ny as f32 - y as f32).powi(2));
-                    sum += w * layer.pixels[ny * layer.width + nx];
-                    weight += w;
-                    if let Some(source_influence) = &layer.influence {
-                        influence |= source_influence[ny * layer.width + nx];
-                    }
-                }
-            }
+            (sum, weight, influence) = repair_ring(layer, marked, x, y, radius);
             if weight > 0.0 {
                 break;
             }
@@ -426,6 +413,32 @@ fn repair_pixels(layer: &mut Layer, marked: &[bool]) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn repair_ring(
+    layer: &Layer,
+    marked: &[bool],
+    x: usize,
+    y: usize,
+    radius: usize,
+) -> (f32, f32, u8) {
+    let mut sum = 0.0;
+    let mut weight = 0.0;
+    let mut influence = 0;
+    for ny in y.saturating_sub(radius)..=(y + radius).min(layer.height - 1) {
+        for nx in x.saturating_sub(radius)..=(x + radius).min(layer.width - 1) {
+            if nx.abs_diff(x).max(ny.abs_diff(y)) != radius || marked[ny * layer.width + nx] {
+                continue;
+            }
+            let w = 1.0 / ((nx as f32 - x as f32).powi(2) + (ny as f32 - y as f32).powi(2));
+            sum += w * layer.pixels[ny * layer.width + nx];
+            weight += w;
+            if let Some(source_influence) = &layer.influence {
+                influence |= source_influence[ny * layer.width + nx];
+            }
+        }
+    }
+    (sum, weight, influence)
 }
 
 fn conversion_matrix(calibration: &Calibration, white_balance: &str) -> Result<[f32; 9]> {
