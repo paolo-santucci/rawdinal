@@ -209,6 +209,17 @@ impl<'a> Dng<'a> {
                 },
             )?;
         }
+        let profile_gain_table_map = match &self.facts.profile_gain_table_map {
+            Some(range) => {
+                let mut bytes = Vec::new();
+                bytes
+                    .try_reserve_exact(range.len())
+                    .map_err(|_| DecodeError::Allocation)?;
+                bytes.extend_from_slice(&self.bytes[range.clone()]);
+                Some(bytes)
+            }
+            None => None,
+        };
         Ok(LinearRawImage {
             width: self.facts.width,
             height: self.facts.height,
@@ -237,7 +248,7 @@ impl<'a> Dng<'a> {
                 .transpose()?,
             default_crop_origin: self.facts.default_crop_origin,
             default_crop_size: self.facts.default_crop_size,
-            profile_gain_table_map: self.facts.profile_gain_table_map.clone(),
+            profile_gain_table_map,
             samples,
             processing: LinearRawProcessingState {
                 linearization: LinearRawProcessing::Applied,
@@ -841,7 +852,7 @@ mod tests {
             Err(DecodeError::InvalidTag)
         ));
         let mut malformed_profile_gain_table_map = fixture();
-        extra_tag(&mut malformed_profile_gain_table_map, 52_509, 3, 1, 0);
+        extra_tag(&mut malformed_profile_gain_table_map, 52_525, 3, 1, 0);
         assert!(matches!(
             Dng::parse(&malformed_profile_gain_table_map),
             Err(DecodeError::UnsupportedFeature)
@@ -945,7 +956,7 @@ mod tests {
             LinearRawProcessing::NotPresent
         );
         let mut bytes = fixture();
-        extra_tag(&mut bytes, 52_509, 7, 1, 0);
+        extra_tag(&mut bytes, 52_525, 7, 1, 0);
         assert_eq!(
             Dng::parse(&bytes)
                 .unwrap()
@@ -963,6 +974,46 @@ mod tests {
                 .profile_gain_table_map,
             Some(vec![0])
         );
+    }
+
+    #[test]
+    fn preserves_large_profile_gain_table_with_a_separate_bound() {
+        let mut bytes = fixture();
+        let offset = bytes.len();
+        let payload = vec![0x5a; 3_158_080];
+        bytes.extend_from_slice(&payload);
+        extra_tag(&mut bytes, 52_525, 7, payload.len() as u32, offset as u32);
+        let image = Dng::parse(&bytes).unwrap().decode().unwrap();
+        assert_eq!(image.profile_gain_table_map.as_ref(), Some(&payload));
+        assert_eq!(
+            image.processing.profile_gain_table_map,
+            LinearRawProcessing::Unapplied
+        );
+        assert_eq!(
+            image.samples,
+            Dng::parse(&fixture()).unwrap().decode().unwrap().samples
+        );
+        assert!(matches!(
+            Dng::parse_with_limits(
+                &bytes,
+                DecodeLimits::default().with_max_profile_gain_table_bytes(payload.len() - 1)
+            ),
+            Err(DecodeError::ResourceLimit)
+        ));
+        bytes.pop();
+        assert!(matches!(Dng::parse(&bytes), Err(DecodeError::Truncated)));
+    }
+
+    #[test]
+    fn does_not_mistake_tag_52509_for_a_profile_gain_table() {
+        let mut bytes = fixture();
+        extra_tag(&mut bytes, 52_509, 7, 1, 0);
+        let image = Dng::parse(&bytes).unwrap().decode().unwrap();
+        assert_eq!(
+            image.processing.profile_gain_table_map,
+            LinearRawProcessing::NotPresent
+        );
+        assert_eq!(image.profile_gain_table_map, None);
     }
 
     #[test]

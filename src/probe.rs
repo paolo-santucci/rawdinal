@@ -32,7 +32,7 @@ const TAG_COLORIMETRIC_REFERENCE: u16 = 50_879;
 const TAG_SUB_TILE_BLOCK_SIZE: u16 = 50_974;
 const TAG_ROW_INTERLEAVE_FACTOR: u16 = 50_975;
 const TAG_BASELINE_EXPOSURE: u16 = 50_730;
-const TAG_PROFILE_GAIN_TABLE_MAP: u16 = 52_509;
+const TAG_PROFILE_GAIN_TABLE_MAP: u16 = 52_525;
 const TAG_PROFILE_TONE_CURVE: u16 = 50_940;
 const TAG_ORIENTATION: u16 = 274;
 const TAG_TILE_WIDTH: u16 = 322;
@@ -50,6 +50,8 @@ pub struct DecodeLimits {
     pub max_ifds: usize,
     pub max_ifd_entries: usize,
     pub max_value_bytes: usize,
+    /// Bound for deferred profile payloads, independent of small numeric TIFF values.
+    pub max_profile_gain_table_bytes: usize,
     pub max_width: u32,
     pub max_height: u32,
     pub max_pixels: u64,
@@ -64,6 +66,7 @@ impl Default for DecodeLimits {
             max_ifds: 64,
             max_ifd_entries: 4_096,
             max_value_bytes: 16 * 1024,
+            max_profile_gain_table_bytes: 16 * 1024 * 1024,
             max_width: 65_536,
             max_height: 65_536,
             max_pixels: 50 * 1024 * 1024,
@@ -88,6 +91,11 @@ impl DecodeLimits {
     }
     pub fn with_max_value_bytes(mut self, value: usize) -> Self {
         self.max_value_bytes = value;
+        self
+    }
+    /// Sets the maximum preserved profile gain-table payload; parsing borrows its byte range.
+    pub fn with_max_profile_gain_table_bytes(mut self, value: usize) -> Self {
+        self.max_profile_gain_table_bytes = value;
         self
     }
     pub fn with_max_dimensions(mut self, width: u32, height: u32) -> Self {
@@ -530,7 +538,8 @@ impl<'a> Parser<'a> {
                     }
                 }
                 TAG_PROFILE_GAIN_TABLE_MAP => {
-                    facts.profile_gain_table_map = Some(self.blob(value, kind, count)?)
+                    facts.profile_gain_table_map =
+                        Some(self.profile_gain_table_range(value, kind, count)?)
                 }
                 TAG_OPCODE_LIST_1 => facts.has_opcode_list_1 = true,
                 TAG_OPCODE_LIST_2 => facts.has_opcode_list_2 = true,
@@ -681,18 +690,28 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn blob(&self, value: usize, kind: u16, count: u32) -> ProbeResult<Vec<u8>> {
+    fn profile_gain_table_range(
+        &self,
+        value: usize,
+        kind: u16,
+        count: u32,
+    ) -> ProbeResult<std::ops::Range<usize>> {
         match kind {
             1 | 7 => {}
             2..=13 => return Err(DecodeError::UnsupportedFeature),
             _ => return Err(DecodeError::InvalidTag),
         }
-        let bytes = self.value(value, kind, count)?;
-        let mut blob = Vec::new();
-        blob.try_reserve_exact(bytes.len())
-            .map_err(|_| DecodeError::Allocation)?;
-        blob.extend_from_slice(bytes);
-        Ok(blob)
+        let size = usize::try_from(count).map_err(|_| DecodeError::ResourceLimit)?;
+        if size > self.limits.max_profile_gain_table_bytes {
+            return Err(DecodeError::ResourceLimit);
+        }
+        let offset = if size <= 4 {
+            value
+        } else {
+            self.reader.offset(value)?
+        };
+        self.reader.bytes(offset, size)?;
+        Ok(offset..offset + size)
     }
 
     fn pair(&self, value: usize, kind: u16, count: u32) -> ProbeResult<[u32; 2]> {
@@ -863,7 +882,7 @@ struct IfdFacts {
     has_opcode_list_1: bool,
     has_opcode_list_2: bool,
     has_opcode_list_3: bool,
-    profile_gain_table_map: Option<Vec<u8>>,
+    profile_gain_table_map: Option<std::ops::Range<usize>>,
     sub_tile_block_size: Option<[u32; 2]>,
     row_interleave_factor: Option<u32>,
 }
@@ -937,7 +956,7 @@ pub(crate) struct DngRawFacts {
     pub has_opcode_list_1: bool,
     pub has_opcode_list_2: bool,
     pub has_opcode_list_3: bool,
-    pub profile_gain_table_map: Option<Vec<u8>>,
+    pub profile_gain_table_map: Option<std::ops::Range<usize>>,
     pub has_semantic_masks: bool,
     pub has_baseline_exposure: bool,
     pub has_profile_tone_curve: bool,
