@@ -39,7 +39,7 @@ _Static_assert(offsetof(rawdinal_raw_v1_probe_info, classification) == 2 * sizeo
 _Static_assert(sizeof(rawdinal_raw_v1_capabilities) == 4 * sizeof(uint32_t), "capabilities descriptor is fixed uint32 layout");
 _Static_assert(offsetof(rawdinal_raw_v1_capabilities, codec_bits) == 2 * sizeof(uint32_t), "codec bits follow header");
 
-#define CHECK(expression) do { if (!(expression)) return 1; } while (0)
+#define CHECK(expression) do { if (!(expression)) { fprintf(stderr, "line %d: %s\n", __LINE__, #expression); return 1; } } while (0)
 
 static uint64_t checksum(const float *samples, size_t count)
 {
@@ -117,16 +117,18 @@ int main(void)
     CHECK(info.white_normalization == RAWDINAL_RAW_V1_PROCESSING_APPLIED);
     CHECK(info.white_balance == RAWDINAL_RAW_V1_PROCESSING_UNAPPLIED);
     CHECK(info.color_conversion == RAWDINAL_RAW_V1_PROCESSING_UNAPPLIED);
-    CHECK(info.default_crop == RAWDINAL_RAW_V1_PROCESSING_UNAPPLIED);
-    CHECK(info.orientation_processing == RAWDINAL_RAW_V1_PROCESSING_NOT_PRESENT);
+    CHECK(info.default_crop == RAWDINAL_RAW_V1_PROCESSING_NOT_PRESENT);
+    CHECK(info.orientation_processing == RAWDINAL_RAW_V1_PROCESSING_UNAPPLIED);
+    CHECK(info.orientation_present && info.orientation == 6);
     CHECK(info.baseline_exposure == RAWDINAL_RAW_V1_PROCESSING_UNAPPLIED);
-    CHECK(info.profile_tone_curve == RAWDINAL_RAW_V1_PROCESSING_NOT_PRESENT);
+    CHECK(info.profile_tone_curve == RAWDINAL_RAW_V1_PROCESSING_UNAPPLIED);
     CHECK(info.demosaic == RAWDINAL_RAW_V1_PROCESSING_NOT_PRESENT);
     CHECK(info.opcode_list_1 == RAWDINAL_RAW_V1_PROCESSING_NOT_PRESENT);
     CHECK(info.opcode_list_2 == RAWDINAL_RAW_V1_PROCESSING_NOT_PRESENT);
     CHECK(info.opcode_list_3 == RAWDINAL_RAW_V1_PROCESSING_NOT_PRESENT);
     CHECK(info.profile_gain_table_map_processing == RAWDINAL_RAW_V1_PROCESSING_UNAPPLIED);
-    CHECK(info.semantic_masks == RAWDINAL_RAW_V1_PROCESSING_NOT_PRESENT);
+    CHECK(info.profile_gain_table_map != NULL && info.profile_gain_table_map_length == 3158080);
+    CHECK(info.semantic_masks == RAWDINAL_RAW_V1_PROCESSING_UNAPPLIED);
     CHECK(info.scene_linear == RAWDINAL_RAW_V1_TRUE && info.camera_native == RAWDINAL_RAW_V1_TRUE);
     CHECK(info.already_demosaiced == RAWDINAL_RAW_V1_TRUE);
     value = checksum(info.samples, info.sample_count);

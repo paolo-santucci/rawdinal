@@ -21,6 +21,14 @@ fn decodes_proraw_sample() {
         .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
     assert_eq!((image.width, image.height, image.channels), (4032, 3024, 3));
     assert!(image.samples.iter().all(|sample| sample.is_finite()));
+    assert_eq!(
+        image.processing.profile_gain_table_map,
+        LinearRawProcessing::Unapplied
+    );
+    assert_eq!(
+        image.profile_gain_table_map.as_ref().unwrap().len(),
+        3_158_080
+    );
     let checksum = checksum(&image.samples);
     assert_eq!(checksum, 0xdefd_c044_2475_559c);
     eprintln!(

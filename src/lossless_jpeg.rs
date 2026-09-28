@@ -491,6 +491,48 @@ impl<'a> Parser<'a> {
 mod tests {
     use super::*;
 
+    #[test]
+    #[ignore = "requires PRORAW_SAMPLE and PRORAW_REFERENCE_DIR from tests/proraw_reference.py"]
+    fn proraw_tiles_match_independent_samples_before_linearization() {
+        let source = std::fs::read(std::env::var_os("PRORAW_SAMPLE").unwrap()).unwrap();
+        let directory = std::path::PathBuf::from(std::env::var_os("PRORAW_REFERENCE_DIR").unwrap());
+        let manifest = std::fs::read_to_string(directory.join("tiles.txt")).unwrap();
+        assert!(!manifest.trim().is_empty());
+        let mut samples = 0;
+        for line in manifest.lines() {
+            let fields: Vec<_> = line.split_whitespace().collect();
+            assert_eq!(fields.len(), 5);
+            let offset: usize = fields[0].parse().unwrap();
+            let length: usize = fields[1].parse().unwrap();
+            let frame = super::decode(
+                &source[offset..offset + length],
+                crate::DecodeLimits::default(),
+            )
+            .unwrap();
+            assert_eq!(frame.width, fields[2].parse::<u16>().unwrap());
+            assert_eq!(frame.height, fields[3].parse::<u16>().unwrap());
+            let reference = std::fs::read(directory.join(fields[4])).unwrap();
+            assert_eq!(reference.len(), frame.samples.len() * 2);
+            for (index, (actual, expected)) in frame
+                .samples
+                .iter()
+                .zip(reference.chunks_exact(2))
+                .enumerate()
+            {
+                assert_eq!(
+                    *actual,
+                    u16::from_le_bytes([expected[0], expected[1]]),
+                    "tile {}, sample {index}",
+                    fields[4]
+                );
+            }
+            samples += frame.samples.len();
+        }
+        eprintln!(
+            "{} tiles, {samples} pre-linearization samples match the independent decoder",
+            manifest.lines().count()
+        );
+    }
     fn segment(stream: &mut Vec<u8>, marker: u8, body: &[u8]) {
         stream.extend_from_slice(&[0xff, marker]);
         stream.extend_from_slice(&(u16::try_from(body.len() + 2).unwrap()).to_be_bytes());
