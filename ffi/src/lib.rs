@@ -8,7 +8,10 @@
 use rawdinal::{
     ByteOrder, ContainerProbe, DecodeError, DecodeLimits, Dng, LinearRawImage, LinearRawProcessing,
     SensorImage as DecodedSensorImage, X3f,
-    experimental::{LinearImage, Reconstruction, render},
+    experimental::{
+        ClippingProvenance, ClippingThresholdProvenance, LinearImage, Reconstruction, render,
+        render_with_clipping_provenance,
+    },
     probe,
 };
 use std::{
@@ -19,7 +22,35 @@ use std::{
 
 pub struct Image {
     pixels: LinearImage,
+    clipping: Option<ClippingProvenance>,
     exif: Vec<u8>,
+}
+
+#[repr(C)]
+#[derive(Default)]
+pub struct ClippingV1Plane {
+    identity: u32,
+    threshold_code: u32,
+    threshold_provenance: u32,
+    reserved: u32,
+    width: usize,
+    height: usize,
+    stride_bytes: usize,
+    byte_count: usize,
+    data: *const u8,
+}
+
+#[repr(C)]
+#[derive(Default)]
+pub struct ClippingV1Info {
+    version: u32,
+    reserved: u32,
+    width: usize,
+    height: usize,
+    stride_bytes: usize,
+    byte_count: usize,
+    data: *const u8,
+    planes: [ClippingV1Plane; 3],
 }
 
 #[repr(C)]
@@ -270,6 +301,35 @@ pub unsafe extern "C" fn rawdinal_decode(
     error: *mut c_char,
     error_capacity: usize,
 ) -> i32 {
+    unsafe { decode_x3f(data, length, output, info, error, error_capacity, false) }
+}
+
+/// Decodes experimental linear sRGB and retains version-1 clipping provenance.
+/// The caller owns the resulting handle and releases it with `rawdinal_free`.
+///
+/// # Safety
+/// The pointer, ownership, and concurrency requirements are identical to `rawdinal_decode`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rawdinal_decode_with_clipping_v1(
+    data: *const u8,
+    length: usize,
+    output: *mut *mut Image,
+    info: *mut ImageInfo,
+    error: *mut c_char,
+    error_capacity: usize,
+) -> i32 {
+    unsafe { decode_x3f(data, length, output, info, error, error_capacity, true) }
+}
+
+unsafe fn decode_x3f(
+    data: *const u8,
+    length: usize,
+    output: *mut *mut Image,
+    info: *mut ImageInfo,
+    error: *mut c_char,
+    error_capacity: usize,
+    with_clipping: bool,
+) -> i32 {
     if output.is_null() || info.is_null() {
         return 1;
     }
@@ -292,14 +352,24 @@ pub unsafe extern "C" fn rawdinal_decode(
         let file = X3f::parse(bytes)?;
         let calibration = file.calibration()?;
         let white_balance = file.white_balance(&calibration)?;
-        let pixels = render(
-            &file.decode()?,
-            &calibration,
-            white_balance,
-            Reconstruction::Guided,
-        )?;
+        let sensor = file.decode()?;
+        let (pixels, clipping) = if with_clipping {
+            let rendered = render_with_clipping_provenance(
+                &sensor,
+                &calibration,
+                white_balance,
+                Reconstruction::Guided,
+            )?;
+            (rendered.image, Some(rendered.clipping))
+        } else {
+            (
+                render(&sensor, &calibration, white_balance, Reconstruction::Guided)?,
+                None,
+            )
+        };
         Ok(Image {
             pixels,
+            clipping,
             exif: file.exif()?.unwrap_or_default().to_vec(),
         })
     }));
@@ -361,6 +431,90 @@ pub unsafe extern "C" fn rawdinal_copy_rgba(
         0
     }))
     .unwrap_or(2)
+}
+
+/// Borrows clipping provenance from a live rendered image.
+///
+/// # Safety
+/// `image` must be a live handle returned by `rawdinal_decode_with_clipping_v1`. `output` must
+/// reference writable storage disjoint from the handle and all handle-owned storage. Borrowed
+/// pointers remain valid only until `rawdinal_free`; the handle must not be accessed or released
+/// concurrently.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rawdinal_get_clipping_v1(
+    image: *const Image,
+    output: *mut ClippingV1Info,
+) -> i32 {
+    if !output.is_null() {
+        unsafe { output.write(ClippingV1Info::default()) };
+    }
+    if image.is_null() || output.is_null() {
+        return 1;
+    }
+    catch_unwind(AssertUnwindSafe(|| {
+        let Some(clipping) = (unsafe { &(*image).clipping }).as_ref() else {
+            return 1;
+        };
+        let Some(info) = clipping_v1_info(clipping) else {
+            return 1;
+        };
+        unsafe { output.write(info) };
+        0
+    }))
+    .unwrap_or_else(|_| {
+        unsafe { output.write(ClippingV1Info::default()) };
+        2
+    })
+}
+
+fn clipping_v1_info(clipping: &ClippingProvenance) -> Option<ClippingV1Info> {
+    let byte_count = clipping.width.checked_mul(clipping.height)?;
+    if clipping.mask.len() != byte_count {
+        return None;
+    }
+    let planes = [
+        clipping_v1_plane(&clipping.planes[0], 0)?,
+        clipping_v1_plane(&clipping.planes[1], 1)?,
+        clipping_v1_plane(&clipping.planes[2], 2)?,
+    ];
+    Some(ClippingV1Info {
+        version: CLIPPING_V1_INFO_VERSION,
+        reserved: 0,
+        width: clipping.width,
+        height: clipping.height,
+        stride_bytes: clipping.width,
+        byte_count,
+        data: clipping.mask.as_ptr(),
+        planes,
+    })
+}
+
+fn clipping_v1_plane(
+    plane: &rawdinal::experimental::ClippingPlane,
+    identity: u32,
+) -> Option<ClippingV1Plane> {
+    let byte_count = plane.width.checked_mul(plane.height)?;
+    (plane.identity == identity && plane.mask.len() == byte_count).then_some(ClippingV1Plane {
+        identity: plane.identity,
+        threshold_code: u32::from(plane.threshold_code),
+        threshold_provenance: clipping_threshold_provenance(plane.threshold_provenance),
+        reserved: 0,
+        width: plane.width,
+        height: plane.height,
+        stride_bytes: plane.width,
+        byte_count,
+        data: plane.mask.as_ptr(),
+    })
+}
+
+fn clipping_threshold_provenance(value: ClippingThresholdProvenance) -> u32 {
+    match value {
+        ClippingThresholdProvenance::Unknown => CLIPPING_V1_THRESHOLD_UNKNOWN,
+        ClippingThresholdProvenance::EstimatedEncodedMaximum => {
+            CLIPPING_V1_THRESHOLD_ESTIMATED_ENCODED_MAXIMUM
+        }
+        ClippingThresholdProvenance::Calibrated => CLIPPING_V1_THRESHOLD_CALIBRATED,
+    }
 }
 
 /// Releases an image; null is accepted.
@@ -803,6 +957,10 @@ pub unsafe extern "C" fn rawdinal_raw_v1_free(image: *mut RawV1Image) {
 }
 
 const RAW_V1_OK: i32 = 0;
+const CLIPPING_V1_INFO_VERSION: u32 = 1;
+const CLIPPING_V1_THRESHOLD_UNKNOWN: u32 = 0;
+const CLIPPING_V1_THRESHOLD_ESTIMATED_ENCODED_MAXIMUM: u32 = 1;
+const CLIPPING_V1_THRESHOLD_CALIBRATED: u32 = 2;
 const RAW_V1_PANIC: i32 = 2;
 const RAW_V1_UNSUPPORTED: i32 = 3;
 const RAW_V1_INVALID_INPUT: i32 = 4;
@@ -1136,6 +1294,133 @@ mod tests {
                 processing: Default::default(),
             },
         }))
+    }
+
+    fn clipping() -> ClippingProvenance {
+        ClippingProvenance {
+            width: 2,
+            height: 1,
+            mask: vec![1, 0],
+            planes: [
+                rawdinal::experimental::ClippingPlane {
+                    identity: 0,
+                    threshold_code: 1023,
+                    threshold_provenance: ClippingThresholdProvenance::EstimatedEncodedMaximum,
+                    width: 1,
+                    height: 1,
+                    mask: vec![1],
+                },
+                rawdinal::experimental::ClippingPlane {
+                    identity: 1,
+                    threshold_code: 1023,
+                    threshold_provenance: ClippingThresholdProvenance::EstimatedEncodedMaximum,
+                    width: 1,
+                    height: 1,
+                    mask: vec![0],
+                },
+                rawdinal::experimental::ClippingPlane {
+                    identity: 2,
+                    threshold_code: 4095,
+                    threshold_provenance: ClippingThresholdProvenance::EstimatedEncodedMaximum,
+                    width: 2,
+                    height: 1,
+                    mask: vec![0, 1],
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn clipping_descriptor_has_stable_layout_and_borrows_masks() {
+        let image = Image {
+            pixels: LinearImage {
+                width: 2,
+                height: 1,
+                rgb: vec![[0.0; 3]; 2],
+            },
+            clipping: Some(clipping()),
+            exif: Vec::new(),
+        };
+        let mut info = ClippingV1Info::default();
+        assert_eq!(unsafe { rawdinal_get_clipping_v1(&image, &mut info) }, 0);
+        assert_eq!(
+            (
+                info.version,
+                info.reserved,
+                info.width,
+                info.height,
+                info.stride_bytes,
+                info.byte_count
+            ),
+            (1, 0, 2, 1, 2, 2)
+        );
+        assert_eq!(
+            unsafe { slice::from_raw_parts(info.data, info.byte_count) },
+            [1, 0]
+        );
+        assert_eq!(
+            std::array::from_fn(|index| {
+                let plane = &info.planes[index];
+                (
+                    plane.identity,
+                    plane.threshold_code,
+                    plane.threshold_provenance,
+                    plane.reserved,
+                    plane.width,
+                    plane.height,
+                    plane.stride_bytes,
+                    plane.byte_count,
+                )
+            }),
+            [
+                (0, 1023, 1, 0, 1, 1, 1, 1),
+                (1, 1023, 1, 0, 1, 1, 1, 1),
+                (2, 4095, 1, 0, 2, 1, 2, 2)
+            ]
+        );
+        assert_eq!(
+            unsafe { slice::from_raw_parts(info.planes[2].data, info.planes[2].byte_count) },
+            [0, 1]
+        );
+    }
+
+    #[test]
+    fn clipping_descriptor_clears_invalid_output() {
+        let mut info = ClippingV1Info {
+            version: 99,
+            data: ptr::NonNull::<u8>::dangling().as_ptr(),
+            ..ClippingV1Info::default()
+        };
+        assert_eq!(
+            unsafe { rawdinal_get_clipping_v1(ptr::null(), &mut info) },
+            1
+        );
+        assert_eq!((info.version, info.data.is_null()), (0, true));
+        let image = Image {
+            pixels: LinearImage {
+                width: 2,
+                height: 1,
+                rgb: vec![[0.0; 3]; 2],
+            },
+            clipping: Some(clipping()),
+            exif: Vec::new(),
+        };
+        assert_eq!(
+            unsafe { rawdinal_get_clipping_v1(&image, ptr::null_mut()) },
+            1
+        );
+        let image = Image {
+            pixels: LinearImage {
+                width: 1,
+                height: 1,
+                rgb: vec![[0.0; 3]],
+            },
+            clipping: None,
+            exif: Vec::new(),
+        };
+        info.version = 99;
+        assert_eq!(unsafe { rawdinal_get_clipping_v1(&image, &mut info) }, 1);
+        assert_eq!(info.version, 0);
     }
 
     #[test]
@@ -1669,7 +1954,7 @@ mod tests {
         let mut info = ImageInfo::default();
         let mut error = [0 as c_char; 256];
         let status = unsafe {
-            rawdinal_decode(
+            rawdinal_decode_with_clipping_v1(
                 bytes.as_ptr(),
                 bytes.len(),
                 &mut image,
@@ -1683,6 +1968,34 @@ mod tests {
         assert_eq!((info.width, info.height), (5424, 3616));
         assert!(info.exif_size > 8);
         assert_eq!(unsafe { slice::from_raw_parts(info.exif, 2) }, b"II");
+        let mut clipping = ClippingV1Info::default();
+        assert_eq!(unsafe { rawdinal_get_clipping_v1(image, &mut clipping) }, 0);
+        assert_eq!(
+            (clipping.version, clipping.width, clipping.height),
+            (1, 5424, 3616)
+        );
+        assert_eq!(clipping.byte_count, clipping.width * clipping.height);
+        assert!(!clipping.data.is_null());
+        assert!(
+            unsafe { slice::from_raw_parts(clipping.data, clipping.byte_count) }
+                .iter()
+                .all(|&value| value <= 1)
+        );
+        for (identity, plane) in clipping.planes.iter().enumerate() {
+            assert_eq!(plane.identity, identity as u32);
+            assert_eq!(
+                plane.threshold_provenance,
+                CLIPPING_V1_THRESHOLD_ESTIMATED_ENCODED_MAXIMUM
+            );
+            assert_eq!(plane.stride_bytes, plane.width);
+            assert_eq!(plane.byte_count, plane.width * plane.height);
+            assert!(!plane.data.is_null());
+            assert!(
+                unsafe { slice::from_raw_parts(plane.data, plane.byte_count) }
+                    .iter()
+                    .all(|&value| value <= 1)
+            );
+        }
         let mut rgba = vec![0.0; info.width as usize * info.height as usize * 4];
         assert_eq!(
             unsafe { rawdinal_copy_rgba(image, rgba.as_mut_ptr(), rgba.len()) },
@@ -1838,6 +2151,7 @@ mod tests {
                 height: 1,
                 rgb: vec![[-0.1, 2.0, 0.3]],
             },
+            clipping: Some(clipping()),
             exif: Vec::new(),
         };
         let mut output = [7.0; 3];
@@ -1853,6 +2167,7 @@ mod tests {
                 height: 1,
                 rgb: vec![[-0.1, 2.0, 0.3]],
             },
+            clipping: Some(clipping()),
             exif: Vec::new(),
         };
         let mut output = [0.0; 4];

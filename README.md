@@ -42,7 +42,7 @@ Cargo and CMake do not build the external X3F Tools source. The dumper creates `
 
 ## C API ownership
 
-`rawdinal_preview` returns storage borrowed from the input buffer. `rawdinal_decode` returns an owned opaque image handle whose EXIF pointer remains valid until `rawdinal_free`. `rawdinal_copy_rgba` copies unbounded linear-sRGB RGBA values into caller-owned storage. `rawdinal_sensor_v1_decode` owns decoded physical planes plus copied EXIF and decompressed CAMF; its getters borrow those buffers until `rawdinal_sensor_v1_free`.
+`rawdinal_preview` returns storage borrowed from the input buffer. `rawdinal_decode` returns an owned opaque image handle whose EXIF pointer remains valid until `rawdinal_free`. `rawdinal_decode_with_clipping_v1` additionally retains output and bottom/middle/top native masks borrowed through `rawdinal_get_clipping_v1` until `rawdinal_free`; threshold flags identify estimated encoded maxima, not calibrated physical saturation. `rawdinal_copy_rgba` copies unbounded linear-sRGB RGBA values into caller-owned storage. `rawdinal_sensor_v1_decode` owns decoded physical planes plus copied EXIF and decompressed CAMF; its getters borrow those buffers until `rawdinal_sensor_v1_free`.
 
 ## License
 
