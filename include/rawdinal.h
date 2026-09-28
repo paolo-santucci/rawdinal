@@ -27,6 +27,10 @@ typedef struct rawdinal_raw_v1_image rawdinal_raw_v1_image;
 #define RAWDINAL_RAW_V1_INFO_VERSION UINT32_C(1)
 #define RAWDINAL_RAW_V1_PROBE_INFO_VERSION UINT32_C(1)
 #define RAWDINAL_RAW_V1_CAPABILITIES_VERSION UINT32_C(1)
+#define RAWDINAL_CLIPPING_V1_INFO_VERSION UINT32_C(1)
+#define RAWDINAL_CLIPPING_V1_THRESHOLD_UNKNOWN UINT32_C(0)
+#define RAWDINAL_CLIPPING_V1_THRESHOLD_ESTIMATED_ENCODED_MAXIMUM UINT32_C(1)
+#define RAWDINAL_CLIPPING_V1_THRESHOLD_CALIBRATED UINT32_C(2)
 #define RAWDINAL_RAW_V1_PROCESSING_NOT_PRESENT UINT32_C(0)
 #define RAWDINAL_RAW_V1_PROCESSING_APPLIED UINT32_C(1)
 #define RAWDINAL_RAW_V1_PROCESSING_UNAPPLIED UINT32_C(2)
@@ -152,6 +156,31 @@ typedef struct rawdinal_info
   size_t exif_size;
 } rawdinal_info;
 
+typedef struct rawdinal_clipping_v1_plane
+{
+  uint32_t identity;
+  uint32_t threshold_code;
+  uint32_t threshold_provenance;
+  uint32_t reserved;
+  size_t width;
+  size_t height;
+  size_t stride_bytes;
+  size_t byte_count;
+  const uint8_t *data;
+} rawdinal_clipping_v1_plane;
+
+typedef struct rawdinal_clipping_v1_info
+{
+  uint32_t version;
+  uint32_t reserved;
+  size_t width;
+  size_t height;
+  size_t stride_bytes;
+  size_t byte_count;
+  const uint8_t *data;
+  rawdinal_clipping_v1_plane planes[3];
+} rawdinal_clipping_v1_info;
+
 /** Borrow the camera JPEG for metadata or thumbnails. The returned storage belongs
  * to the input mapping and expires with it. Returns zero on success. */
 int32_t rawdinal_preview(const uint8_t *data, size_t length, const uint8_t **preview, size_t *preview_length);
@@ -163,9 +192,25 @@ int32_t rawdinal_preview(const uint8_t *data, size_t length, const uint8_t **pre
 int32_t rawdinal_decode(const uint8_t *data, size_t length, rawdinal_image **output,
                        rawdinal_info *info, char *error, size_t error_capacity);
 
+/** Decode to experimental linear sRGB and retain version-1 clipping provenance. Ownership,
+ * argument, error, and release rules are identical to rawdinal_decode. */
+int32_t rawdinal_decode_with_clipping_v1(const uint8_t *data, size_t length,
+                                        rawdinal_image **output, rawdinal_info *info,
+                                        char *error, size_t error_capacity);
+
 /** Copy to width*height*4 caller-owned floats without clipping. Alpha is one.
  * The image handle must remain live and the destination must not overlap it. */
 int32_t rawdinal_copy_rgba(const rawdinal_image *image, float *destination, size_t float_count);
+
+/** Borrow version-1 estimated encoded-maximum clipping provenance from a handle returned by
+ * rawdinal_decode_with_clipping_v1. The combined output mask has
+ * one byte per output pixel and native planes are bottom, middle, top. A nonzero byte means that
+ * contributing source support met its layer's estimated encoded maximum; it does not indicate
+ * calibrated physical saturation. All pointers expire with rawdinal_free. Output must be writable
+ * and disjoint from the handle and its owned storage, is cleared on failure, and the handle must
+ * not be accessed or released concurrently. */
+int32_t rawdinal_get_clipping_v1(const rawdinal_image *image,
+                                 rawdinal_clipping_v1_info *output);
 
 /** Release exactly once after all reads. Null is accepted. */
 void rawdinal_free(rawdinal_image *image);
