@@ -368,6 +368,42 @@ mod tests {
     }
 
     #[test]
+    fn decodes_high_bit_unsigned_and_fractional_matrix_values() {
+        for (kind, bytes, expected) in [
+            (
+                1,
+                &[255, 255, 255, 255, 0, 0, 0, 128][..],
+                [4294967295.0, 2147483648.0],
+            ),
+            (
+                2,
+                &[255, 255, 255, 255, 0, 0, 0, 128][..],
+                [4294967295.0, 2147483648.0],
+            ),
+            (3, &[0, 0, 192, 63, 0, 0, 16, 192][..], [1.5, -2.25]),
+            (5, &[128, 255][..], [128.0, 255.0]),
+        ] {
+            let entry = matrix_entry(kind, bytes, 2);
+            let mut budget = MAX_MATRIX_VALUES;
+            let decoded = parse_matrix(Reader(&entry), 20, &mut budget).unwrap();
+            assert_eq!(decoded.values, expected, "matrix type {kind}");
+        }
+    }
+
+    #[test]
+    fn preserves_matrix_descriptor_dimensions_and_payload_order() {
+        let mut entry = vec![0; 56];
+        for (offset, value) in [(20, 5u32), (24, 2), (28, 56), (32, 2), (44, 3), (52, 1)] {
+            entry[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        entry.extend([11, 12, 13, 21, 22, 23]);
+        let mut budget = MAX_MATRIX_VALUES;
+        let matrix = parse_matrix(Reader(&entry), 20, &mut budget).unwrap();
+        assert_eq!(matrix.dimensions, [2, 3]);
+        assert_eq!(matrix.values, [11.0, 12.0, 13.0, 21.0, 22.0, 23.0]);
+    }
+
+    #[test]
     fn rejects_non_finite_float_calibration() {
         let entry = matrix_entry(3, &f32::NAN.to_le_bytes(), 1);
         let mut budget = MAX_MATRIX_VALUES;
@@ -497,6 +533,19 @@ mod tests {
     }
 
     #[test]
+    fn resolves_properties_relative_to_the_declared_string_area() {
+        let mut entry = vec![0; 44];
+        entry[20..24].copy_from_slice(&1u32.to_le_bytes());
+        entry[24..28].copy_from_slice(&44u32.to_le_bytes());
+        entry[32..36].copy_from_slice(&4u32.to_le_bytes());
+        entry.extend(b"key\0value\0");
+        let mut budget = MAX_PROPERTY_STRING_BYTES;
+        let properties = parse_properties(Reader(&entry), 20, &mut budget).unwrap();
+        assert_eq!(properties, BTreeMap::from([("key".into(), "value".into())]));
+        assert_eq!(budget, MAX_PROPERTY_STRING_BYTES - 10);
+    }
+
+    #[test]
     fn rejects_aliased_property_strings_over_the_aggregate_budget() {
         let mut entry = vec![0; 40 + 1024 * 1024 + 1];
         entry[20..24].copy_from_slice(&2u32.to_le_bytes());
@@ -562,6 +611,40 @@ mod tests {
         assert_eq!(
             decompress(Reader(&type4_section(3))).unwrap(),
             [0x12, 0x31, 0x23]
+        );
+    }
+
+    #[test]
+    fn decodes_type4_mixed_values_across_predictor_rows() {
+        let mut section = type4_section(24);
+        section.truncate(60);
+        section[16..20].copy_from_slice(&0x100u32.to_le_bytes());
+        section[20..24].copy_from_slice(&4u32.to_le_bytes());
+        section[24..28].copy_from_slice(&4u32.to_le_bytes());
+        section[28..38].copy_from_slice(&[2, 0, 2, 64, 2, 128, 2, 192, 0, 0]);
+        section[56..60].copy_from_slice(&8u32.to_le_bytes());
+        section.extend([0x75, 0x6b, 0x93, 0x0e, 0x9a, 0x37, 0x6e, 0x40]);
+        assert_eq!(
+            decompress(Reader(&section)).unwrap(),
+            [
+                0x10, 0x11, 0x02, 0x10, 0x41, 0x01, 0x10, 0x40, 0xfe, 0x10, 0x10, 0xff, 0x10, 0x31,
+                0x03, 0x10, 0x21, 0x03, 0x10, 0x01, 0x01, 0x10, 0x10, 0xff,
+            ]
+        );
+    }
+
+    #[test]
+    fn decodes_type5_positive_and_negative_wraparound() {
+        let mut section = type4_section(8);
+        section.truncate(60);
+        section[8..12].copy_from_slice(&5u32.to_le_bytes());
+        section[16..20].copy_from_slice(&u32::MAX.to_le_bytes());
+        section[28..34].copy_from_slice(&[1, 0, 1, 128, 0, 0]);
+        section[56..60].copy_from_slice(&2u32.to_le_bytes());
+        section.extend([0xfa, 0xbc]);
+        assert_eq!(
+            decompress(Reader(&section)).unwrap(),
+            [0, 1, 0, 255, 254, 255, 0, 0]
         );
     }
 

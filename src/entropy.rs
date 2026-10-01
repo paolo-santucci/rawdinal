@@ -159,6 +159,40 @@ mod tests {
     }
 
     #[test]
+    fn decodes_mixed_categories_at_exact_stream_end() {
+        let table = [2, 0, 2, 64, 2, 128, 2, 192, 0, 0];
+        let book = Codebook::parse(Reader(&table), &mut 0).unwrap();
+        let mut bits = Bits::new(&[0x1a, 0xa8, 0xe6, 0x1a]);
+        for expected in [0, 1, -1, 2, -3, 4, -7, 1, -1] {
+            assert_eq!(book.difference(&mut bits).unwrap(), expected);
+        }
+        assert!(book.difference(&mut bits).is_err());
+    }
+
+    #[test]
+    fn decodes_signed_endpoints_for_every_difference_category() {
+        let table: Vec<_> = (0..=16)
+            .flat_map(|symbol| [8, symbol])
+            .chain([0, 0])
+            .collect();
+        let book = Codebook::parse(Reader(&table), &mut 0).unwrap();
+        for category in 1..=16u8 {
+            let minimum_magnitude = 1u32 << (category - 1);
+            let maximum_magnitude = (1u32 << category) - 1;
+            for (payload, expected) in [
+                (0, -(maximum_magnitude as i32)),
+                (minimum_magnitude - 1, -(minimum_magnitude as i32)),
+                (minimum_magnitude, minimum_magnitude as i32),
+                (maximum_magnitude, maximum_magnitude as i32),
+            ] {
+                let aligned = ((payload << (16 - category)) as u16).to_be_bytes();
+                let stream = [category, aligned[0], aligned[1]];
+                assert_eq!(book.difference(&mut Bits::new(&stream)).unwrap(), expected);
+            }
+        }
+    }
+
+    #[test]
     fn rejects_prefix_collision() {
         assert!(Codebook::parse(Reader(&[1, 0, 2, 0, 0, 0]), &mut 0).is_err());
     }
