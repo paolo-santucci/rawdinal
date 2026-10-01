@@ -12,6 +12,8 @@ use std::collections::BTreeMap;
 
 const MAX_CALIBRATION_BYTES: usize = 32 * 1024 * 1024;
 const MAX_PROPERTY_STRING_BYTES: usize = 4 * 1024 * 1024;
+const MAX_MATRIX_VALUES: usize = MAX_CALIBRATION_BYTES / size_of::<f64>();
+const MAX_PROPERTIES: usize = 64 * 1024;
 
 #[derive(Debug)]
 pub struct Matrix {
@@ -47,6 +49,8 @@ impl Calibration {
         let mut entries = BTreeMap::new();
         let mut offset = 0;
         let mut remaining_property_strings = MAX_PROPERTY_STRING_BYTES;
+        let mut remaining_properties = MAX_PROPERTIES;
+        let mut remaining_matrix_values = MAX_MATRIX_VALUES;
         while offset < bytes.len() {
             if entries.len() >= 4096 {
                 return Err(invalid("too many calibration entries"));
@@ -57,7 +61,11 @@ impl Calibration {
                 return Err(invalid("invalid CAMF entry size"));
             }
             let entry = Reader(remaining.bytes(0, size)?);
-            let name = entry.string(entry.size(12)?)?.to_owned();
+            let name_offset = entry.size(12)?;
+            if name_offset < 20 {
+                return Err(invalid("invalid CAMF name offset"));
+            }
+            let name = entry.string(name_offset)?.to_owned();
             let value_offset = entry.size(16)?;
             if value_offset < 20 {
                 return Err(invalid("invalid CAMF value offset"));
@@ -70,12 +78,21 @@ impl Calibration {
                         std::str::from_utf8(text).map_err(|_| invalid("invalid CAMF text"))?;
                     Entry::Text(text.trim_end_matches('\0').to_owned())
                 }
-                b"CMbP" => Entry::Properties(parse_properties(
+                b"CMbP" => {
+                    remaining_properties = remaining_properties
+                        .checked_sub(entry.size(value_offset)?)
+                        .ok_or_else(|| invalid("too many calibration properties"))?;
+                    Entry::Properties(parse_properties(
+                        entry,
+                        value_offset,
+                        &mut remaining_property_strings,
+                    )?)
+                }
+                b"CMbM" => Entry::Matrix(parse_matrix(
                     entry,
                     value_offset,
-                    &mut remaining_property_strings,
+                    &mut remaining_matrix_values,
                 )?),
-                b"CMbM" => Entry::Matrix(parse_matrix(entry, value_offset)?),
                 _ => return Err(invalid("unknown CAMF entry type")),
             };
             if entries.insert(name, value).is_some() {
@@ -136,9 +153,7 @@ fn decompress_type5(section: Reader<'_>) -> Result<Vec<u8>> {
         return Err(invalid("CAMF codebook overlaps stream header"));
     }
     let stream = data.bytes(32, data.size(28)?)?;
-    if size > stream.len() * 8 {
-        return Err(invalid("CAMF size exceeds entropy capacity"));
-    }
+    book.validate_capacity(stream.len(), size)?;
     let mut bits = Bits::new(stream);
     let mut decoded: Vec<u8> = zeroed(size)?;
     let mut accumulator = section.u32(16)?;
@@ -176,9 +191,7 @@ fn decompress_type4(section: Reader<'_>) -> Result<Vec<u8>> {
         return Err(invalid("CAMF codebook overlaps stream header"));
     }
     let stream = data.bytes(32, data.size(28)?)?;
-    if values > stream.len().saturating_mul(8) {
-        return Err(invalid("CAMF size exceeds entropy capacity"));
-    }
+    book.validate_capacity(stream.len(), values)?;
     let mut decoded = zeroed(size)?;
     let mut bits = Bits::new(stream);
     let mut row_start = [[seed; 2]; 2];
@@ -238,6 +251,11 @@ fn parse_properties(
     if count > 4096 {
         return Err(invalid("too many calibration properties"));
     }
+    let table_size = 8 + count * 8;
+    entry.bytes(offset, table_size)?;
+    if strings < offset + table_size || strings > entry.0.len() {
+        return Err(invalid("invalid calibration property strings offset"));
+    }
     let mut properties = BTreeMap::new();
     for index in 0..count {
         let name_offset = strings
@@ -270,12 +288,17 @@ fn property_string<'a>(entry: Reader<'a>, offset: usize, remaining: &mut usize) 
     std::str::from_utf8(&bounded[..length]).map_err(|_| invalid("invalid UTF-8 metadata"))
 }
 
-fn parse_matrix(entry: Reader<'_>, offset: usize) -> Result<Matrix> {
+fn parse_matrix(entry: Reader<'_>, offset: usize, remaining_values: &mut usize) -> Result<Matrix> {
     let kind = entry.u32(offset)?;
     let dimension_count = entry.size(offset + 4)?;
     let data_offset = entry.size(offset + 8)?;
     if !(1..=3).contains(&dimension_count) {
         return Err(invalid("unsupported matrix dimensions"));
+    }
+    let descriptor_size = 12 + 12 * dimension_count;
+    entry.bytes(offset, descriptor_size)?;
+    if data_offset < offset + descriptor_size {
+        return Err(invalid("matrix data overlaps descriptor"));
     }
     let mut dimensions = Vec::new();
     let mut count = 1usize;
@@ -296,6 +319,9 @@ fn parse_matrix(entry: Reader<'_>, offset: usize) -> Result<Matrix> {
         .checked_mul(element_size)
         .ok_or_else(|| invalid("matrix size overflow"))?;
     let data = Reader(entry.bytes(data_offset, byte_count)?);
+    *remaining_values = remaining_values
+        .checked_sub(count)
+        .ok_or_else(|| invalid("calibration matrices exceed supported limits"))?;
     let mut values = zeroed(count)?;
     for (index, value) in values.iter_mut().enumerate() {
         let position = index * element_size;
@@ -331,20 +357,134 @@ mod tests {
     fn decodes_signed_and_unsigned_sixteen_bit_matrices() {
         for (kind, expected) in [(0, [-1.0, -32768.0]), (6, [65535.0, 32768.0])] {
             let entry = matrix_entry(kind, &[255, 255, 0, 128], 2);
-            assert_eq!(parse_matrix(Reader(&entry), 20).unwrap().values, expected);
+            let mut budget = MAX_MATRIX_VALUES;
+            assert_eq!(
+                parse_matrix(Reader(&entry), 20, &mut budget)
+                    .unwrap()
+                    .values,
+                expected
+            );
         }
     }
 
     #[test]
     fn rejects_non_finite_float_calibration() {
         let entry = matrix_entry(3, &f32::NAN.to_le_bytes(), 1);
-        assert!(parse_matrix(Reader(&entry), 20).is_err());
+        let mut budget = MAX_MATRIX_VALUES;
+        assert!(parse_matrix(Reader(&entry), 20, &mut budget).is_err());
     }
 
     #[test]
     fn rejects_matrix_payload_outside_entry() {
         let entry = matrix_entry(3, &[0; 4], u32::MAX);
-        assert!(parse_matrix(Reader(&entry), 20).is_err());
+        let mut budget = MAX_MATRIX_VALUES;
+        assert!(parse_matrix(Reader(&entry), 20, &mut budget).is_err());
+    }
+
+    #[test]
+    fn rejects_matrix_payload_aliasing_its_descriptor() {
+        let mut entry = matrix_entry(5, &[42], 1);
+        entry[28..32].copy_from_slice(&32u32.to_le_bytes());
+        let mut budget = MAX_MATRIX_VALUES;
+        assert!(parse_matrix(Reader(&entry), 20, &mut budget).is_err());
+    }
+
+    #[test]
+    fn rejects_matrix_expansion_over_the_calibration_budget() {
+        let entry = matrix_entry(5, &vec![0; 4 * 1024 * 1024 + 1], 4 * 1024 * 1024 + 1);
+        let mut budget = MAX_MATRIX_VALUES;
+        assert!(parse_matrix(Reader(&entry), 20, &mut budget).is_err());
+    }
+
+    fn named_matrix_entry(name: &str, count: usize) -> Vec<u8> {
+        let mut entry = matrix_entry(5, &vec![0; count], count as u32);
+        let name_offset = entry.len() as u32;
+        entry.extend(name.bytes());
+        entry.push(0);
+        let size = entry.len() as u32;
+        entry[..4].copy_from_slice(b"CMbM");
+        entry[8..12].copy_from_slice(&size.to_le_bytes());
+        entry[12..16].copy_from_slice(&name_offset.to_le_bytes());
+        entry[16..20].copy_from_slice(&20u32.to_le_bytes());
+        entry
+    }
+
+    #[test]
+    fn rejects_matrices_that_exceed_the_aggregate_expansion_budget() {
+        let mut bytes = named_matrix_entry("First", MAX_MATRIX_VALUES / 2 + 1);
+        bytes.extend(named_matrix_entry("Second", MAX_MATRIX_VALUES / 2 + 1));
+        assert_eq!(
+            Calibration::parse_entries(&bytes).unwrap_err().to_string(),
+            "calibration matrices exceed supported limits"
+        );
+    }
+
+    #[test]
+    fn rejects_entry_names_pointing_into_the_header() {
+        let mut entry = named_matrix_entry("Name", 1);
+        entry[12..16].copy_from_slice(&4u32.to_le_bytes());
+        assert!(Calibration::parse_entries(&entry).is_err());
+    }
+
+    #[test]
+    fn rejects_properties_over_the_aggregate_entry_budget() {
+        let mut bytes = Vec::new();
+        for index in 0..17 {
+            let strings = 36 + 4096 * 8;
+            let mut entry = vec![0; strings];
+            entry[..4].copy_from_slice(b"CMbP");
+            entry[12..16].copy_from_slice(&20u32.to_le_bytes());
+            entry[16..20].copy_from_slice(&28u32.to_le_bytes());
+            entry[20..24].copy_from_slice(format!("{index:04x}").as_bytes());
+            entry[28..32].copy_from_slice(&4096u32.to_le_bytes());
+            entry[32..36].copy_from_slice(&(strings as u32).to_le_bytes());
+            for property in 0..4096 {
+                let slot = 36 + property * 8;
+                let offset = (entry.len() - strings) as u32;
+                entry[slot..slot + 4].copy_from_slice(&offset.to_le_bytes());
+                entry[slot + 4..slot + 8].copy_from_slice(&(offset + 4).to_le_bytes());
+                entry.extend(format!("{property:04x}\0").bytes());
+            }
+            let size = entry.len() as u32;
+            entry[8..12].copy_from_slice(&size.to_le_bytes());
+            bytes.extend(entry);
+        }
+        assert_eq!(
+            Calibration::parse_entries(&bytes).unwrap_err().to_string(),
+            "too many calibration properties"
+        );
+    }
+
+    #[test]
+    fn matrix_metadata_mutations_and_truncations_never_panic() {
+        let original = named_matrix_entry("Matrix", 16);
+        for size in 0..original.len() {
+            assert!(Calibration::parse_entries(&original[..size]).is_err() || size == 0);
+        }
+        for offset in 0..original.len() {
+            for value in [0, 1, 127, 255] {
+                let mut bytes = original.clone();
+                bytes[offset] = value;
+                let _ = Calibration::parse_entries(&bytes);
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_property_strings_aliasing_the_offset_table() {
+        let mut entry = vec![0; 40];
+        entry[20..24].copy_from_slice(&1u32.to_le_bytes());
+        entry[24..28].copy_from_slice(&28u32.to_le_bytes());
+        let mut budget = MAX_PROPERTY_STRING_BYTES;
+        assert!(parse_properties(Reader(&entry), 20, &mut budget).is_err());
+    }
+
+    #[test]
+    fn rejects_empty_property_table_with_out_of_bounds_strings() {
+        let mut entry = vec![0; 28];
+        entry[24..28].copy_from_slice(&u32::MAX.to_le_bytes());
+        let mut budget = MAX_PROPERTY_STRING_BYTES;
+        assert!(parse_properties(Reader(&entry), 20, &mut budget).is_err());
     }
 
     #[test]
@@ -447,5 +587,33 @@ mod tests {
         let mut blocks = type4_section(3);
         blocks[20..24].copy_from_slice(&1u32.to_le_bytes());
         assert!(decompress(Reader(&blocks)).is_err());
+    }
+
+    #[test]
+    fn type4_rejects_predictor_overflow_and_invalid_entropy_capacity() {
+        let mut section = type4_section(3);
+        section[16..20].copy_from_slice(&4096u32.to_le_bytes());
+        assert!(decompress(Reader(&section)).is_err());
+        section[16..20].copy_from_slice(&0u32.to_le_bytes());
+        section[28] = 8;
+        assert_eq!(
+            decompress(Reader(&section)).unwrap_err().to_string(),
+            "declared output exceeds entropy capacity"
+        );
+    }
+
+    #[test]
+    fn type4_header_mutations_and_all_truncations_never_panic() {
+        let original = type4_section(4);
+        for size in 0..original.len() {
+            assert!(decompress(Reader(&original[..size])).is_err());
+        }
+        for offset in 4..original.len() {
+            for value in [0, 1, 127, 255] {
+                let mut bytes = original.clone();
+                bytes[offset] = value;
+                let _ = decompress(Reader(&bytes));
+            }
+        }
     }
 }
