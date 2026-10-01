@@ -4,8 +4,12 @@
 //! Test-only pre-color reconstruction diagnostics under the renderer's assumed 2x2 footprint.
 //! Residuals measure consistency with calibrated native samples, not physical reconstruction error.
 
-use super::*;
-use crate::X3f;
+use super::{
+    Crop, InterpolationSupport, Layer, Regression, calibrate, downsample, interpolation_support,
+    local_regression, marked_pixels, measure_black, sample_coefficients, support_has_influence,
+    validate_geometry,
+};
+use crate::{Calibration, Plane, X3f};
 use std::path::Path;
 
 struct Projection<'a> {
