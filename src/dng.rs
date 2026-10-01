@@ -1,7 +1,10 @@
-use crate::lossless_jpeg;
+use crate::DngMetadata;
+use crate::dng_codec::{self, TileSpec};
+use crate::dng_metadata::{allocate, own_metadata};
+use crate::dng_normalize::Normalization;
+use crate::dng_opcode::{OpcodeList, Stage};
 use crate::probe::{ByteOrder, DecodeError, DecodeLimits, DngRawFacts, ProbeResult, dng_raw_facts};
 
-const COMPRESSION_LOSSLESS_JPEG: u16 = 7;
 const PHOTOMETRIC_LINEAR_RAW: u16 = 34_892;
 
 /// A parsed, bounded DNG container supporting the narrow Apple ProRAW tiled layout.
@@ -21,6 +24,28 @@ pub enum LinearRawProcessing {
     Unapplied,
     Unknown,
     SkippedOptional,
+    PartiallyApplied,
+}
+
+/// Optional diagnostic storage. Defaults avoid retaining another full-resolution sample buffer.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DngDecodeOptions {
+    pub retain_encoded_samples: bool,
+    pub retain_sample_flags: bool,
+    pub decode_semantic_masks: bool,
+}
+
+/// One 8-bit semantic weight image, independent of the primary RGB calibration.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DngSemanticMask {
+    pub ifd_offset: u32,
+    pub width: u32,
+    pub height: u32,
+    pub name: Option<String>,
+    pub instance_id: Option<String>,
+    /// `[top, left, full_width, full_height]`; absent means the stored mask fills its canvas.
+    pub sub_area: Option<[u32; 4]>,
+    pub samples: Vec<u8>,
 }
 
 /// Processing state of a decoded camera-native linear raw image.
@@ -91,6 +116,40 @@ pub struct LinearRawImage {
     pub processing: LinearRawProcessingState,
 }
 
+/// Extended DNG result, retaining scoped metadata and optional diagnostics.
+/// The legacy pixel descriptor remains available through `image` and dereferencing.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DngDecodedImage {
+    pub image: LinearRawImage,
+    pub metadata: DngMetadata,
+    /// Exact rational crop metadata, including fractional values omitted by legacy integer fields.
+    pub default_crop_origin_exact: Option<[f64; 2]>,
+    pub default_crop_size_exact: Option<[f64; 2]>,
+    /// Region containing valid processed pixels after active-area and opcode trimming.
+    /// Numerical values outside this region are unspecified and must be excluded from processing.
+    pub valid_area: [u32; 4],
+    /// Original decompressed, assembled codes before opcode list 1 and linearization.
+    pub encoded_samples: Option<Vec<u16>>,
+    /// Per-sample bits before opcodes: 1 encoded maximum, 2 `L(original_code) >= WhiteLevel`,
+    /// 4 outside active area. Bit 8 is an image-wide indication that opcode processing occurred,
+    /// not a per-sample modification mask. None implies measured photosite saturation.
+    pub sample_flags: Option<Vec<u8>>,
+    pub semantic_masks: Vec<DngSemanticMask>,
+}
+
+impl std::ops::Deref for DngDecodedImage {
+    type Target = LinearRawImage;
+    fn deref(&self) -> &Self::Target {
+        &self.image
+    }
+}
+
+impl std::ops::DerefMut for DngDecodedImage {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.image
+    }
+}
+
 impl<'a> Dng<'a> {
     /// Parses a DNG using default bounded decode limits.
     pub fn parse(bytes: &'a [u8]) -> ProbeResult<Self> {
@@ -99,7 +158,8 @@ impl<'a> Dng<'a> {
 
     /// Parses a DNG using caller-provided bounded decode limits.
     pub fn parse_with_limits(bytes: &'a [u8], limits: DecodeLimits) -> ProbeResult<Self> {
-        let facts = dng_raw_facts(bytes, limits)?;
+        let mut facts = dng_raw_facts(bytes, limits)?;
+        configure_storage(&mut facts)?;
         validate_layout(bytes, &facts, limits)?;
         Ok(Self {
             bytes,
@@ -108,8 +168,21 @@ impl<'a> Dng<'a> {
         })
     }
 
-    /// Decodes the supported tiled lossless-JPEG DNG layout into camera-native scene-referred samples.
+    /// Decodes camera-native scene-referred samples with the legacy integer geometry descriptor.
+    /// Fractional crop or opcode trimming requires [`Self::decode_with_options`].
     pub fn decode(&self) -> ProbeResult<LinearRawImage> {
+        let decoded = self.decode_with_options(DngDecodeOptions::default())?;
+        if decoded.valid_area != decoded.active_area
+            || (decoded.default_crop_origin_exact.is_some()
+                && decoded.default_crop_origin.is_none())
+            || (decoded.default_crop_size_exact.is_some() && decoded.default_crop_size.is_none())
+        {
+            return Err(DecodeError::UnsupportedFeature);
+        }
+        Ok(decoded.image)
+    }
+
+    fn decode_codes(&self) -> ProbeResult<(Vec<f32>, Vec<u8>)> {
         let tile_width = usize::try_from(
             self.facts
                 .tile_width
@@ -135,21 +208,6 @@ impl<'a> Dng<'a> {
             .tile_byte_counts
             .as_ref()
             .ok_or(DecodeError::UnsupportedFeature)?;
-        let linearization = self
-            .facts
-            .linearization_table
-            .as_ref()
-            .ok_or(DecodeError::UnsupportedFeature)?;
-        let black = self
-            .facts
-            .black_level
-            .as_ref()
-            .ok_or(DecodeError::UnsupportedFeature)?;
-        let white = self
-            .facts
-            .white_level
-            .as_ref()
-            .ok_or(DecodeError::UnsupportedFeature)?;
         let channels = usize::from(self.facts.samples_per_pixel);
         let count = width
             .checked_mul(height)
@@ -161,28 +219,39 @@ impl<'a> Dng<'a> {
             .map_err(|_| DecodeError::Allocation)?;
         samples.resize(count, 0.0);
         let columns = width.div_ceil(tile_width);
-        let mut component_ids = None;
+        let blocks_per_plane = columns * height.div_ceil(tile_length);
+        let planar = self.facts.planar_configuration == 2;
+        let frame_channels = if planar { 1 } else { channels };
+        let mut component_ids = if planar { Some(vec![1, 2, 3]) } else { None };
         for (tile, (&offset, &byte_count)) in offsets.iter().zip(byte_counts).enumerate() {
+            let plane = if planar { tile / blocks_per_plane } else { 0 };
+            let tile = tile % blocks_per_plane;
             let payload = checked_payload(self.bytes, offset, byte_count)?;
-            let frame = lossless_jpeg::decode(payload, self.limits)?;
-            if usize::from(frame.width) != tile_width
-                || usize::from(frame.height) != tile_length
-                || frame.precision != self.facts.bits_per_sample[0] as u8
-                || frame.component_ids.len() != channels
-                || frame.samples.len()
-                    != tile_width
-                        .checked_mul(tile_length)
-                        .and_then(|value| value.checked_mul(channels))
-                        .ok_or(DecodeError::ResourceLimit)?
-            {
-                return Err(DecodeError::UnsupportedFeature);
-            }
-            if let Some(expected) = &component_ids {
-                if expected != &frame.component_ids {
-                    return Err(DecodeError::UnsupportedFeature);
-                }
+            let block_height = if self.facts.has_strip_offsets {
+                tile_length.min(height - tile * tile_length)
             } else {
-                component_ids = Some(frame.component_ids.clone());
+                tile_length
+            };
+            let frame = dng_codec::decode(
+                payload,
+                TileSpec {
+                    width: tile_width as u32,
+                    height: block_height as u32,
+                    channels: frame_channels as u16,
+                    bits: self.facts.bits_per_sample[0],
+                    compression: self.facts.compression,
+                    order: self.facts.byte_order,
+                },
+                self.limits,
+            )?;
+            if !planar {
+                if let Some(expected) = &component_ids {
+                    if expected != &frame.component_ids {
+                        return Err(DecodeError::UnsupportedFeature);
+                    }
+                } else {
+                    component_ids = Some(frame.component_ids.clone());
+                }
             }
             let tile_x = (tile % columns)
                 .checked_mul(tile_width)
@@ -192,22 +261,95 @@ impl<'a> Dng<'a> {
                 .ok_or(DecodeError::ResourceLimit)?;
             let copy_width = (width - tile_x).min(tile_width);
             let copy_height = (height - tile_y).min(tile_length);
-            copy_tile(
-                &mut samples,
-                &frame.samples,
-                TileCopy {
-                    image_width: width,
-                    tile_width,
-                    tile_x,
-                    tile_y,
-                    copy_width,
-                    copy_height,
-                    channels,
-                    linearization,
-                    black,
-                    white,
-                },
-            )?;
+            for y in 0..copy_height {
+                let source = y * tile_width * frame_channels;
+                let destination = ((tile_y + y) * width + tile_x) * channels + plane;
+                for x in 0..copy_width {
+                    for channel in 0..frame_channels {
+                        samples[destination + x * channels + channel] =
+                            f32::from(frame.samples[source + x * frame_channels + channel]);
+                    }
+                }
+            }
+        }
+        reorder_interleaved_image(&mut samples, &self.facts)?;
+        Ok((samples, component_ids.ok_or(DecodeError::InvalidContainer)?))
+    }
+
+    /// Decodes extended geometry, scoped metadata and optional diagnostic buffers.
+    pub fn decode_with_options(&self, options: DngDecodeOptions) -> ProbeResult<DngDecodedImage> {
+        let (mut samples, component_ids) = self.decode_codes()?;
+        let count = samples.len();
+        let normalization = Normalization::new(&self.facts)?;
+        let encoded_samples = if options.retain_encoded_samples {
+            let mut codes = allocate(count)?;
+            codes.extend(samples.iter().map(|&value| value as u16));
+            Some(codes)
+        } else {
+            None
+        };
+        let mut sample_flags = if options.retain_sample_flags {
+            Some(normalization.flags(&samples)?)
+        } else {
+            None
+        };
+        let active = self
+            .facts
+            .active_area
+            .unwrap_or([0, 0, self.facts.height, self.facts.width]);
+        let lists = self.opcode_lists()?;
+        let mut first = Stage {
+            samples: &mut samples,
+            width: self.facts.width,
+            origin: [0, 0],
+            bounds: [0, 0, self.facts.height, self.facts.width],
+            number: 1,
+        };
+        if let Some(list) = &lists[0] {
+            list.apply(&mut first)?;
+        }
+        if first.bounds[0] > active[0]
+            || first.bounds[1] > active[1]
+            || first.bounds[2] < active[2]
+            || first.bounds[3] < active[3]
+        {
+            return Err(DecodeError::InvalidGeometry);
+        }
+        normalization.apply(&mut samples)?;
+        let mut stage = Stage {
+            samples: &mut samples,
+            width: self.facts.width,
+            origin: [active[0], active[1]],
+            bounds: [0, 0, active[2] - active[0], active[3] - active[1]],
+            number: 2,
+        };
+        for (index, list) in lists.iter().enumerate().skip(1) {
+            stage.number = index as u8 + 1;
+            if let Some(list) = list {
+                list.apply(&mut stage)?;
+            }
+        }
+        let valid_area = [
+            stage.bounds[0] + active[0],
+            stage.bounds[1] + active[1],
+            stage.bounds[2] + active[0],
+            stage.bounds[3] + active[1],
+        ];
+        let opcode_processing = lists.each_ref().map(|list| {
+            list.as_ref()
+                .map_or(LinearRawProcessing::NotPresent, OpcodeList::processing)
+        });
+        if opcode_processing.iter().any(|state| {
+            matches!(
+                state,
+                LinearRawProcessing::Applied | LinearRawProcessing::PartiallyApplied
+            )
+        }) {
+            if let Some(flags) = &mut sample_flags {
+                for flag in flags {
+                    *flag |= 8;
+                }
+            }
         }
         let profile_gain_table_map = match &self.facts.profile_gain_table_map {
             Some(range) => {
@@ -220,85 +362,201 @@ impl<'a> Dng<'a> {
             }
             None => None,
         };
-        Ok(LinearRawImage {
-            width: self.facts.width,
-            height: self.facts.height,
-            channels: self.facts.samples_per_pixel as u8,
-            component_ids: component_ids.ok_or(DecodeError::InvalidContainer)?,
-            dng_version: self.facts.dng_version,
-            dng_backward_version: self.facts.dng_backward_version,
-            tiff_byte_order: self.facts.byte_order,
-            make: self
-                .facts
-                .make
-                .clone()
-                .ok_or(DecodeError::UnsupportedFeature)?,
-            model: self.facts.model.clone(),
-            colorimetric_reference: self.facts.colorimetric_reference,
-            active_area: self.facts.active_area.unwrap_or([
-                0,
-                0,
-                self.facts.height,
-                self.facts.width,
-            ]),
-            orientation: self
-                .facts
-                .orientation
-                .map(|value| u16::try_from(value).map_err(|_| DecodeError::UnsupportedFeature))
-                .transpose()?,
-            default_crop_origin: self.facts.default_crop_origin,
-            default_crop_size: self.facts.default_crop_size,
-            profile_gain_table_map,
-            samples,
-            processing: LinearRawProcessingState {
-                linearization: LinearRawProcessing::Applied,
-                black_subtraction: LinearRawProcessing::Applied,
-                white_normalization: LinearRawProcessing::Applied,
-                white_balance: LinearRawProcessing::Unapplied,
-                color_conversion: LinearRawProcessing::Unapplied,
-                default_crop: if self.facts.active_area.is_some()
-                    || self.facts.default_crop_origin.is_some()
-                    || self.facts.default_crop_size.is_some()
-                {
-                    LinearRawProcessing::Unapplied
-                } else {
-                    LinearRawProcessing::NotPresent
+        let metadata = own_metadata(self.bytes, &self.facts)?;
+        let has_gain_table =
+            self.facts.profile_gain_table_map.is_some() || metadata.root().tag(52544).is_some();
+        Ok(DngDecodedImage {
+            image: LinearRawImage {
+                width: self.facts.width,
+                height: self.facts.height,
+                channels: self.facts.samples_per_pixel as u8,
+                component_ids,
+                dng_version: self.facts.dng_version,
+                dng_backward_version: self.facts.dng_backward_version,
+                tiff_byte_order: self.facts.byte_order,
+                make: self
+                    .facts
+                    .make
+                    .clone()
+                    .ok_or(DecodeError::UnsupportedFeature)?,
+                model: self.facts.model.clone(),
+                colorimetric_reference: self.facts.colorimetric_reference,
+                active_area: self.facts.active_area.unwrap_or([
+                    0,
+                    0,
+                    self.facts.height,
+                    self.facts.width,
+                ]),
+                orientation: self
+                    .facts
+                    .orientation
+                    .map(|value| u16::try_from(value).map_err(|_| DecodeError::UnsupportedFeature))
+                    .transpose()?,
+                default_crop_origin: self.facts.default_crop_origin,
+                default_crop_size: self.facts.default_crop_size,
+                profile_gain_table_map,
+                samples,
+                processing: LinearRawProcessingState {
+                    linearization: if self.facts.linearization_table.is_some() {
+                        LinearRawProcessing::Applied
+                    } else {
+                        LinearRawProcessing::NotPresent
+                    },
+                    black_subtraction: LinearRawProcessing::Applied,
+                    white_normalization: LinearRawProcessing::Applied,
+                    white_balance: LinearRawProcessing::Unapplied,
+                    color_conversion: LinearRawProcessing::Unapplied,
+                    default_crop: if self.facts.active_area.is_some()
+                        || self.facts.default_crop_origin_exact.is_some()
+                        || self.facts.default_crop_size_exact.is_some()
+                    {
+                        LinearRawProcessing::Unapplied
+                    } else {
+                        LinearRawProcessing::NotPresent
+                    },
+                    orientation: if self.facts.orientation.is_some_and(|value| value != 1) {
+                        LinearRawProcessing::Unapplied
+                    } else {
+                        LinearRawProcessing::NotPresent
+                    },
+                    baseline_exposure: if self.facts.has_baseline_exposure {
+                        LinearRawProcessing::Unapplied
+                    } else {
+                        LinearRawProcessing::NotPresent
+                    },
+                    profile_tone_curve: if self.facts.has_profile_tone_curve {
+                        LinearRawProcessing::Unapplied
+                    } else {
+                        LinearRawProcessing::NotPresent
+                    },
+                    demosaic: LinearRawProcessing::NotPresent,
+                    opcode_list_1: opcode_processing[0],
+                    opcode_list_2: opcode_processing[1],
+                    opcode_list_3: opcode_processing[2],
+                    profile_gain_table_map: if has_gain_table {
+                        LinearRawProcessing::Unapplied
+                    } else {
+                        LinearRawProcessing::NotPresent
+                    },
+                    semantic_masks: if self.facts.has_semantic_masks {
+                        LinearRawProcessing::Unapplied
+                    } else {
+                        LinearRawProcessing::NotPresent
+                    },
                 },
-                orientation: if self.facts.orientation.is_some_and(|value| value != 1) {
-                    LinearRawProcessing::Unapplied
-                } else {
-                    LinearRawProcessing::NotPresent
-                },
-                baseline_exposure: if self.facts.has_baseline_exposure {
-                    LinearRawProcessing::Unapplied
-                } else {
-                    LinearRawProcessing::NotPresent
-                },
-                profile_tone_curve: if self.facts.has_profile_tone_curve {
-                    LinearRawProcessing::Unapplied
-                } else {
-                    LinearRawProcessing::NotPresent
-                },
-                demosaic: LinearRawProcessing::NotPresent,
-                opcode_list_1: LinearRawProcessing::NotPresent,
-                opcode_list_2: LinearRawProcessing::NotPresent,
-                opcode_list_3: LinearRawProcessing::NotPresent,
-                profile_gain_table_map: if self.facts.profile_gain_table_map.is_some() {
-                    LinearRawProcessing::Unapplied
-                } else {
-                    LinearRawProcessing::NotPresent
-                },
-                semantic_masks: if self.facts.has_semantic_masks {
-                    LinearRawProcessing::Unapplied
-                } else {
-                    LinearRawProcessing::NotPresent
-                },
+            },
+            metadata,
+            default_crop_origin_exact: self.facts.default_crop_origin_exact,
+            default_crop_size_exact: self.facts.default_crop_size_exact,
+            valid_area,
+            encoded_samples,
+            sample_flags,
+            semantic_masks: if options.decode_semantic_masks {
+                self.decode_semantic_masks()?
+            } else {
+                Vec::new()
             },
         })
     }
+
+    fn opcode_lists(&self) -> ProbeResult<[Option<OpcodeList>; 3]> {
+        let parse = |index: usize| {
+            self.facts.opcode_lists[index]
+                .as_ref()
+                .map(|range| OpcodeList::parse(&self.bytes[range.clone()]))
+                .transpose()
+        };
+        Ok([parse(0)?, parse(1)?, parse(2)?])
+    }
+
+    /// Decodes semantic weights without applying RGB calibration, crop, orientation or resampling.
+    pub fn decode_semantic_masks(&self) -> ProbeResult<Vec<DngSemanticMask>> {
+        crate::dng_mask::decode(
+            self.bytes,
+            &own_metadata(self.bytes, &self.facts)?,
+            self.limits,
+        )
+    }
+
+    /// Borrows the first complete JPEG preview from a reduced-resolution image IFD.
+    /// The JPEG is not decoded or color transformed and the returned bytes borrow this DNG's input.
+    pub fn jpeg_preview(&self) -> ProbeResult<Option<&'a [u8]>> {
+        for directory in &self.facts.directories {
+            let scalar = |id| -> ProbeResult<Option<u32>> {
+                let Some(tag) = directory.tags.iter().find(|tag| tag.id == id) else {
+                    return Ok(None);
+                };
+                if tag.count != 1 || !matches!(tag.field_type, 3 | 4) {
+                    return Ok(None);
+                }
+                Ok(Some(crate::dng_metadata::number(
+                    &self.bytes[tag.range.clone()],
+                    tag.field_type,
+                    0,
+                    self.facts.byte_order,
+                )? as u32))
+            };
+            if scalar(254)?.unwrap_or(0) & 1 == 0 {
+                continue;
+            }
+            let pair = if let (Some(offset), Some(length)) = (scalar(513)?, scalar(514)?) {
+                Some((offset, length))
+            } else if matches!(scalar(259)?, Some(6 | 7)) && matches!(scalar(262)?, Some(2 | 6)) {
+                scalar(273)?.zip(scalar(279)?)
+            } else {
+                None
+            };
+            if let Some((offset, length)) = pair {
+                let payload = checked_payload(self.bytes, offset, length)?;
+                if payload.starts_with(&[0xff, 0xd8]) && payload.ends_with(&[0xff, 0xd9]) {
+                    return Ok(Some(payload));
+                }
+            }
+        }
+        Ok(None)
+    }
+}
+
+fn configure_storage(facts: &mut DngRawFacts) -> ProbeResult<()> {
+    if facts.has_strip_offsets {
+        if facts.tile_offsets.is_some() || facts.tile_byte_counts.is_some() {
+            return Err(DecodeError::UnsupportedFeature);
+        }
+        facts.tile_width = Some(facts.width);
+        facts.tile_length = Some(
+            facts
+                .rows_per_strip
+                .unwrap_or(facts.height)
+                .min(facts.height),
+        );
+        facts.tile_offsets = facts.strip_offsets.take();
+        facts.tile_byte_counts = facts.strip_byte_counts.take();
+    }
+    Ok(())
 }
 
 fn validate_layout(bytes: &[u8], facts: &DngRawFacts, limits: DecodeLimits) -> ProbeResult<()> {
+    let directory = facts
+        .directories
+        .iter()
+        .find(|directory| directory.offset == facts.raw_offset)
+        .ok_or(DecodeError::InvalidContainer)?;
+    for id in [266, 317] {
+        if let Some(tag) = directory.tags.iter().find(|tag| tag.id == id) {
+            if tag.count != 1 || tag.field_type != 3 {
+                return Err(DecodeError::InvalidTag);
+            }
+            if crate::dng_metadata::number(
+                &bytes[tag.range.clone()],
+                tag.field_type,
+                0,
+                facts.byte_order,
+            )? != 1.0
+            {
+                return Err(DecodeError::UnsupportedFeature);
+            }
+        }
+    }
     if facts
         .orientation
         .is_some_and(|value| !(1..=8).contains(&value))
@@ -306,27 +564,23 @@ fn validate_layout(bytes: &[u8], facts: &DngRawFacts, limits: DecodeLimits) -> P
         return Err(DecodeError::InvalidTag);
     }
     if facts.photometric != PHOTOMETRIC_LINEAR_RAW
-        || facts.compression != COMPRESSION_LOSSLESS_JPEG
-        || facts.has_strip_offsets
-        || facts.planar_configuration != 1
-        || facts.dng_version[0..2] != [1, 6]
-        || !facts
-            .dng_backward_version
-            .is_some_and(|version| version[0] == 1 && version[1] <= 3)
+        || !matches!(facts.compression, 1 | 7 | 34892 | 52546)
+        || facts.dng_version < [1, 0, 0, 0]
+        || facts.dng_version > [1, 7, 1, 0]
+        || facts.dng_backward_version.is_some_and(|version| {
+            !([1, 0, 0, 0]..=[1, 7, 1, 0]).contains(&version) || version > facts.dng_version
+        })
         || facts.make.as_deref() != Some("Apple")
-        || facts.has_opcode_list_1
-        || facts.has_opcode_list_2
-        || facts.has_opcode_list_3
         || facts.colorimetric_reference.is_some_and(|value| value != 0)
         || facts
             .sub_tile_block_size
             .is_some_and(|value| value != [1, 1])
-        || facts.row_interleave_factor.is_some_and(|value| value != 1)
         || facts
-            .black_level_repeat_dim
-            .is_some_and(|value| value != [1, 1])
-        || facts.has_black_level_delta_h
-        || facts.has_black_level_delta_v
+            .row_interleave_factor
+            .is_some_and(|value| value == 0 || value > facts.height)
+        || facts
+            .column_interleave_factor
+            .is_some_and(|value| value == 0 || value > facts.width)
         || facts.samples_per_pixel != 3
         || facts.sample_format != [1; 3]
         || facts.bits_per_sample.len() != 3
@@ -338,42 +592,34 @@ fn validate_layout(bytes: &[u8], facts: &DngRawFacts, limits: DecodeLimits) -> P
         return Err(DecodeError::UnsupportedFeature);
     }
     let bits = facts.bits_per_sample[0];
-    let expected_lut_entries = 1_usize
-        .checked_shl(u32::from(bits))
-        .ok_or(DecodeError::UnsupportedFeature)?;
-    if bits != 12
-        || expected_lut_entries != 4096
-        || facts.linearization_table.as_ref().map(Vec::len) != Some(4096)
-        || facts.black_level.as_ref().map(Vec::len) != Some(3)
-        || facts.white_level.as_ref().map(Vec::len) != Some(3)
-    {
-        return Err(DecodeError::UnsupportedFeature);
-    }
-    if facts
-        .black_level
-        .as_ref()
-        .unwrap()
-        .iter()
-        .zip(facts.white_level.as_ref().unwrap())
-        .any(|(black, white)| black >= white)
-    {
+    if !(8..=16).contains(&bits) || (facts.compression == 34892 && bits != 8) {
         return Err(DecodeError::UnsupportedFeature);
     }
     validate_geometry_metadata(facts)?;
+    Normalization::new(facts)?;
+    for range in facts.opcode_lists.iter().flatten() {
+        OpcodeList::parse(&bytes[range.clone()])?;
+    }
     let tile_width = facts.tile_width.ok_or(DecodeError::UnsupportedFeature)?;
     let tile_length = facts.tile_length.ok_or(DecodeError::UnsupportedFeature)?;
     if tile_width == 0
         || tile_length == 0
-        || tile_width > u32::from(u16::MAX)
-        || tile_length > u32::from(u16::MAX)
+        || (matches!(facts.compression, 7 | 34892)
+            && (tile_width > u32::from(u16::MAX) || tile_length > u32::from(u16::MAX)))
     {
         return Err(DecodeError::UnsupportedFeature);
     }
     let columns = facts.width.div_ceil(tile_width);
     let rows = facts.height.div_ceil(tile_length);
+    let planes = if facts.planar_configuration == 2 {
+        3
+    } else {
+        1
+    };
     let expected_tiles = usize::try_from(
         u64::from(columns)
             .checked_mul(u64::from(rows))
+            .and_then(|value| value.checked_mul(planes))
             .ok_or(DecodeError::ResourceLimit)?,
     )
     .map_err(|_| DecodeError::ResourceLimit)?;
@@ -384,7 +630,7 @@ fn validate_layout(bytes: &[u8], facts: &DngRawFacts, limits: DecodeLimits) -> P
     }
     let decoded = u64::from(tile_width)
         .checked_mul(u64::from(tile_length))
-        .and_then(|value| value.checked_mul(u64::from(facts.samples_per_pixel)))
+        .and_then(|value| value.checked_mul(u64::from(facts.samples_per_pixel) / planes))
         .and_then(|value| value.checked_mul(u64::try_from(expected_tiles).ok()?))
         .ok_or(DecodeError::ResourceLimit)?;
     if decoded > limits.max_decoded_samples {
@@ -405,6 +651,37 @@ fn validate_layout(bytes: &[u8], facts: &DngRawFacts, limits: DecodeLimits) -> P
     Ok(())
 }
 
+fn reorder_interleaved_image(samples: &mut Vec<f32>, facts: &DngRawFacts) -> ProbeResult<()> {
+    let rows = facts.row_interleave_factor.unwrap_or(1) as usize;
+    let columns = facts.column_interleave_factor.unwrap_or(1) as usize;
+    if rows == 1 && columns == 1 {
+        return Ok(());
+    }
+    let width = facts.width as usize;
+    let height = facts.height as usize;
+    let row_order = interleaved_order(height, rows)?;
+    let column_order = interleaved_order(width, columns)?;
+    let mut output = allocate(samples.len())?;
+    output.resize(samples.len(), 0.0);
+    for (row, &destination_row) in row_order.iter().enumerate() {
+        for (column, &destination_column) in column_order.iter().enumerate() {
+            let source = (row * width + column) * 3;
+            let destination = (destination_row * width + destination_column) * 3;
+            output[destination..destination + 3].copy_from_slice(&samples[source..source + 3]);
+        }
+    }
+    *samples = output;
+    Ok(())
+}
+
+fn interleaved_order(length: usize, factor: usize) -> ProbeResult<Vec<usize>> {
+    let mut order = allocate(length)?;
+    for phase in 0..factor {
+        order.extend((phase..length).step_by(factor));
+    }
+    Ok(order)
+}
+
 fn validate_geometry_metadata(facts: &DngRawFacts) -> ProbeResult<()> {
     let active_area = facts
         .active_area
@@ -415,24 +692,25 @@ fn validate_geometry_metadata(facts: &DngRawFacts) -> ProbeResult<()> {
     }
     let active_width = right - left;
     let active_height = bottom - top;
-    if let Some([x, y]) = facts.default_crop_origin {
-        if x > active_width || y > active_height {
+    if let Some([x, y]) = facts.default_crop_origin_exact {
+        if x < 0.0 || y < 0.0 || x > f64::from(active_width) || y > f64::from(active_height) {
             return Err(DecodeError::InvalidGeometry);
         }
     }
-    if let Some([width, height]) = facts.default_crop_size {
-        if width == 0 || height == 0 || width > active_width || height > active_height {
-            return Err(DecodeError::InvalidGeometry);
-        }
-    }
-    if let (Some([x, y]), Some([width, height])) =
-        (facts.default_crop_origin, facts.default_crop_size)
-    {
-        if x.checked_add(width)
-            .is_none_or(|right| right > active_width)
-            || y.checked_add(height)
-                .is_none_or(|bottom| bottom > active_height)
+    if let Some([width, height]) = facts.default_crop_size_exact {
+        if width <= 0.0
+            || height <= 0.0
+            || width > f64::from(active_width)
+            || height > f64::from(active_height)
         {
+            return Err(DecodeError::InvalidGeometry);
+        }
+    }
+    if let (Some([x, y]), Some([width, height])) = (
+        facts.default_crop_origin_exact,
+        facts.default_crop_size_exact,
+    ) {
+        if x + width > f64::from(active_width) || y + height > f64::from(active_height) {
             return Err(DecodeError::InvalidGeometry);
         }
     }
@@ -479,63 +757,6 @@ fn checked_payload(bytes: &[u8], offset: u32, count: u32) -> ProbeResult<&[u8]> 
         .checked_add(count)
         .ok_or(DecodeError::InvalidOffset)?;
     bytes.get(offset..end).ok_or(DecodeError::Truncated)
-}
-
-struct TileCopy<'a> {
-    image_width: usize,
-    tile_width: usize,
-    tile_x: usize,
-    tile_y: usize,
-    copy_width: usize,
-    copy_height: usize,
-    channels: usize,
-    linearization: &'a [u16],
-    black: &'a [u16],
-    white: &'a [u16],
-}
-
-fn copy_tile(output: &mut [f32], tile: &[u16], copy: TileCopy<'_>) -> ProbeResult<()> {
-    for y in 0..copy.copy_height {
-        for x in 0..copy.copy_width {
-            for channel in 0..copy.channels {
-                let source = y
-                    .checked_mul(copy.tile_width)
-                    .and_then(|value| value.checked_add(x))
-                    .and_then(|value| value.checked_mul(copy.channels))
-                    .and_then(|value| value.checked_add(channel))
-                    .ok_or(DecodeError::ResourceLimit)?;
-                let destination = copy
-                    .tile_y
-                    .checked_add(y)
-                    .and_then(|value| value.checked_mul(copy.image_width))
-                    .and_then(|value| value.checked_add(copy.tile_x))
-                    .and_then(|value| value.checked_add(x))
-                    .and_then(|value| value.checked_mul(copy.channels))
-                    .and_then(|value| value.checked_add(channel))
-                    .ok_or(DecodeError::ResourceLimit)?;
-                let linearized = *copy
-                    .linearization
-                    .get(usize::from(
-                        *tile.get(source).ok_or(DecodeError::InvalidContainer)?,
-                    ))
-                    .ok_or(DecodeError::InvalidContainer)?;
-                let black = *copy
-                    .black
-                    .get(channel)
-                    .ok_or(DecodeError::InvalidContainer)?;
-                let white = *copy
-                    .white
-                    .get(channel)
-                    .ok_or(DecodeError::InvalidContainer)?;
-                *output
-                    .get_mut(destination)
-                    .ok_or(DecodeError::InvalidContainer)? = (f32::from(linearized)
-                    - f32::from(black))
-                    / (f32::from(white) - f32::from(black));
-            }
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -829,21 +1050,18 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unapplied_dng_processing_features() {
-        for (tag, kind, count, value) in [
-            (50_715, 7, 1, 0),
-            (50_716, 7, 1, 0),
-            (50_879, 3, 1, 1),
-            (51_008, 7, 1, 0),
-            (51_009, 7, 1, 0),
-            (51_022, 7, 1, 0),
+    fn rejects_malformed_processing_and_output_referred_features() {
+        for (tag, kind, count, value, expected) in [
+            (50_715, 7, 1, 0, DecodeError::InvalidTag),
+            (50_716, 7, 1, 0, DecodeError::InvalidTag),
+            (50_879, 3, 1, 1, DecodeError::UnsupportedFeature),
+            (51_008, 7, 1, 0, DecodeError::Truncated),
+            (51_009, 7, 1, 0, DecodeError::Truncated),
+            (51_022, 7, 1, 0, DecodeError::Truncated),
         ] {
             let mut bytes = fixture();
             extra_tag(&mut bytes, tag, kind, count, value);
-            assert!(matches!(
-                Dng::parse(&bytes),
-                Err(DecodeError::UnsupportedFeature)
-            ));
+            assert_eq!(Dng::parse(&bytes).unwrap_err(), expected);
         }
         let mut repeated_black = fixture();
         extra_tag(&mut repeated_black, 50_713, 3, 2, 0x0002_0001);
@@ -922,7 +1140,7 @@ mod tests {
     #[test]
     fn rejects_non_default_spatial_layouts() {
         assert!(Dng::parse(&fixture()).is_ok());
-        for (tag, kind, count, value) in [(50_974, 4, 2, 8_624), (50_975, 4, 1, 2)] {
+        for (tag, kind, count, value) in [(50_974, 4, 2, 8_624), (50_975, 4, 1, 3)] {
             let mut bytes = fixture();
             extra_tag(&mut bytes, tag, kind, count, value);
             if tag == 50_974 {
@@ -1188,56 +1406,9 @@ mod tests {
     }
 
     #[test]
-    fn preserves_unclamped_values_after_nonlinear_linearization() {
-        let mut output = [0.0; 3];
-        copy_tile(
-            &mut output,
-            &[0, 1, 2],
-            TileCopy {
-                image_width: 1,
-                tile_width: 1,
-                tile_x: 0,
-                tile_y: 0,
-                copy_width: 1,
-                copy_height: 1,
-                channels: 3,
-                linearization: &[2047, 2049, 2051],
-                black: &[2048; 3],
-                white: &[2050; 3],
-            },
-        )
-        .unwrap();
-        assert_eq!(output, [-0.5, 0.5, 1.5]);
-    }
-
-    #[test]
-    fn copies_partial_tiles_without_crossing_channels() {
-        let mut output = [0.0; 18];
-        copy_tile(
-            &mut output,
-            &[0, 1, 2, 3, 4, 5, 6, 7],
-            TileCopy {
-                image_width: 3,
-                tile_width: 2,
-                tile_x: 2,
-                tile_y: 2,
-                copy_width: 1,
-                copy_height: 1,
-                channels: 2,
-                linearization: &[10, 20, 30, 40, 50, 60, 70, 80],
-                black: &[0, 0],
-                white: &[10, 10],
-            },
-        )
-        .unwrap();
-        assert_eq!(&output[16..], &[1.0, 2.0]);
-        assert!(output[..16].iter().all(|&sample| sample == 0.0));
-    }
-
-    #[test]
     fn rejects_profiles_outside_the_supported_apple_contract() {
         let mut future_version = fixture();
-        entry(&mut future_version, IFD0 + 2, 50_706, 1, 4, 0x0000_0701);
+        entry(&mut future_version, IFD0 + 2, 50_706, 1, 4, 0x0000_0801);
         assert!(matches!(
             Dng::parse(&future_version),
             Err(DecodeError::UnsupportedFeature)
@@ -1249,7 +1420,7 @@ mod tests {
             50_707,
             1,
             4,
-            0x0000_0401,
+            0x0000_0801,
         );
         assert!(matches!(
             Dng::parse(&incompatible_backward_version),
@@ -1268,11 +1439,8 @@ mod tests {
             50_714,
             4,
             3,
-            8_624,
+            8_800,
         );
-        assert!(matches!(
-            Dng::parse(&wide_black_level),
-            Err(DecodeError::UnsupportedFeature)
-        ));
+        assert!(Dng::parse(&wide_black_level).is_ok());
     }
 }
