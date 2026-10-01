@@ -215,7 +215,7 @@ int32_t rawdinal_get_clipping_v1(const rawdinal_image *image,
 /** Release exactly once after all reads. Null is accepted. */
 void rawdinal_free(rawdinal_image *image);
 
-/** Decode the narrow observed DP2 Merrill, dp3 Quattro and sd Quattro sensor layouts
+/** Decode the observed Merrill, dp Quattro, sd Quattro and sd Quattro H sensor layouts
  * without calibration, reconstruction, white balance or color conversion. Samples are
  * uncalibrated. Input storage is borrowed only during the call. Output must be writable,
  * disjoint from all other arguments and must not contain an unreleased handle. It is cleared
