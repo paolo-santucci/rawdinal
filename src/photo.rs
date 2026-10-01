@@ -23,6 +23,12 @@ pub(crate) fn exif(jpeg: Reader<'_>) -> Result<Option<&[u8]>> {
         if marker == 218 || marker == 217 {
             return Ok(None);
         }
+        if marker == 0 || (208..=216).contains(&marker) {
+            return Err(invalid("invalid JPEG metadata marker"));
+        }
+        if marker == 1 {
+            continue;
+        }
         let length_bytes = jpeg.bytes(offset, 2)?;
         let length = usize::from(u16::from_be_bytes([length_bytes[0], length_bytes[1]]));
         if length < 2 {
@@ -151,6 +157,49 @@ mod tests {
     fn rejects_truncated_jpeg_segments() {
         for bytes in [&[255, 216, 255][..], &[255, 216, 255, 225, 0, 40, 0][..]] {
             assert!(light_source(Reader(bytes)).is_err());
+        }
+    }
+
+    #[test]
+    fn rejects_stuffed_bytes_restart_markers_and_nested_soi_in_metadata() {
+        for marker in [0, 208, 209, 210, 211, 212, 213, 214, 215, 216] {
+            assert!(exif(Reader(&[255, 216, 255, marker, 0, 2, 255, 217])).is_err());
+        }
+    }
+
+    #[test]
+    fn skips_standalone_tem_and_marker_fill_bytes() {
+        assert_eq!(
+            exif(Reader(&[255, 216, 255, 1, 255, 255, 217])).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn rejects_exif_directory_offsets_and_counts_outside_the_payload() {
+        let mut bytes = [0; 32];
+        bytes[..4].copy_from_slice(b"II*\0");
+        for offset in [0, 7, 31, u32::MAX] {
+            bytes[4..8].copy_from_slice(&offset.to_le_bytes());
+            assert!(Tiff::parse(Reader(&bytes)).unwrap().light_source().is_err());
+        }
+        bytes[4..8].copy_from_slice(&8u32.to_le_bytes());
+        bytes[8..10].copy_from_slice(&u16::MAX.to_le_bytes());
+        assert!(Tiff::parse(Reader(&bytes)).unwrap().light_source().is_err());
+    }
+
+    #[test]
+    fn jpeg_exif_mutations_and_truncations_never_panic() {
+        let bytes = b"\xff\xd8\xff\xe1\x00\x16Exif\0\0II*\0\x08\0\0\0\0\0\0\0\0\0\xff\xd9";
+        for size in 0..bytes.len() {
+            let _ = light_source(Reader(&bytes[..size]));
+        }
+        for offset in 0..bytes.len() {
+            for value in [0, 1, 127, 255] {
+                let mut mutated = bytes.to_vec();
+                mutated[offset] = value;
+                let _ = light_source(Reader(&mutated));
+            }
         }
     }
 }
