@@ -11,6 +11,9 @@
 
 use crate::{Calibration, Plane, Result, SensorImage, invalid, zeroed};
 
+#[cfg(test)]
+mod diagnostics;
+
 pub struct LinearImage {
     pub width: usize,
     pub height: usize,

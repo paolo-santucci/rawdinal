@@ -353,6 +353,20 @@ mod tests {
     }
 
     #[test]
+    fn decodes_distinct_parity_histories_and_preserves_row_starts() {
+        let table = [2, 0, 2, 64, 2, 128, 2, 192, 0, 0];
+        let book = Codebook::parse(Reader(&table), &mut 0).unwrap();
+        let stream = [0x75, 0x6b, 0x93, 0x0e, 0x9a, 0x37, 0x6e, 0x40];
+        let plane = decode_plane(&stream, &book, (4, 4), 100).unwrap();
+        assert_eq!(
+            plane.samples,
+            [
+                101, 102, 104, 101, 104, 98, 101, 99, 103, 103, 102, 103, 100, 101, 101, 99
+            ]
+        );
+    }
+
+    #[test]
     fn rejects_predictor_overflow() {
         let book = Codebook::parse(Reader(&[1, 0, 1, 128, 0, 0]), &mut 0).unwrap();
         assert!(decode_plane(&[255; 2], &book, (2, 2), 65535).is_err());
