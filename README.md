@@ -45,16 +45,67 @@ Pre-linearization tile samples from 21 original ProRAW files have matched the in
 
 ## Build and test
 
-Rawdinal requires Rust 1.85 or newer and currently supports native Linux builds.
+Install Rust 1.85 or newer with Cargo. The C library build also requires CMake 3.21 or newer and a C11 compiler. Build definitions cover native Linux, macOS (Intel or Apple Silicon) and Windows (MSVC). Windows and macOS still need validation on native hosts; the checks performed so far are on Linux. CMake rejects cross-compilation and macOS universal builds.
+
+### Rust workspace
+
+Run from the repository root:
 
 ```sh
+cargo build --workspace --release --locked
 cargo test --workspace --locked
+```
+
+The `rawdinal` package provides the Rust library and the X3F-only `rawdinal-inspect` command. `rawdinal-ffi` produces `librawdinal_ffi.a` on Linux/macOS or `rawdinal_ffi.lib` with Windows MSVC. Its public C header is [`include/rawdinal.h`](include/rawdinal.h).
+
+### Linux
+
+Install a C compiler, CMake and Make or Ninja, then run:
+
+```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --parallel
 ctest --test-dir build --output-on-failure
 ```
 
-The CMake build exposes the `rawdinal` target when included with `add_subdirectory`. Standalone builds install `include/rawdinal.h` with the static library by default; embedded builds can opt in with `RAWDINAL_INSTALL=ON`.
+### macOS
+
+Install the Xcode Command Line Tools (`xcode-select --install`), CMake, and a native Rust toolchain matching your Mac's architecture. `Makefile.macos` uses the Make supplied by the developer tools:
+
+```sh
+make -f Makefile.macos
+make -f Makefile.macos test
+make -f Makefile.macos install PREFIX="$HOME/.local"
+make -f Makefile.macos clean
+```
+
+The default build directory is `build/macos`; override it with `BUILD_DIR=path`. The install prefix defaults to `/usr/local`. CMake selects `aarch64-apple-darwin` or `x86_64-apple-darwin` and forwards an explicitly configured `CMAKE_OSX_DEPLOYMENT_TARGET` to Cargo.
+
+### Windows
+
+Install Visual Studio 2022 Build Tools with the Desktop development with C++ workload and a Windows SDK, CMake, and Rust's MSVC toolchain. Open a Visual Studio Developer Command Prompt for the same architecture as your Rust toolchain (for example, the x64 Native Tools prompt with `x86_64-pc-windows-msvc`). Run these commands from the repository root:
+
+```bat
+nmake /f Makefile.windows
+nmake /f Makefile.windows test
+nmake /f Makefile.windows install PREFIX="C:\rawdinal"
+nmake /f Makefile.windows clean
+```
+
+`Makefile.windows` uses NMAKE, not GNU Make. It defaults to `build\windows` for builds and `build\install` for installation; override them with `BUILD_DIR=path` and `PREFIX=path`. CMake selects the corresponding MSVC Rust target for x64, x86 or ARM64; that target must be installed. MinGW is not supported by this build definition.
+
+### CMake integration and installation
+
+Both makefiles build the release static library and C ABI test executables. Their `test` target also runs the Rust workspace tests. CMake invokes Cargo with `--release --offline --locked`; the workspace has no external Rust crates to fetch. Build output lives under the chosen build directory, with Cargo artifacts in its `cargo/` subdirectory.
+
+The CMake build exposes the `rawdinal` target, including platform-specific system link libraries, when included with `add_subdirectory`:
+
+```cmake
+add_subdirectory(path/to/rawdinal)
+target_link_libraries(your_application PRIVATE rawdinal)
+```
+
+Standalone builds install the static library, `include/rawdinal.h` and license files by default. Embedded builds can opt in with `RAWDINAL_INSTALL=ON`. For a direct CMake build, use `cmake --install build --config Release --prefix /your/prefix`; with a multi-configuration generator, also pass `--config Release` to the build and `-C Release` to CTest. The makefiles provide `configure`, `build` (the default), `test`, `install` and `clean` targets. `clean` removes generated build products while retaining the configured build tree and Cargo caches.
 
 ## Independent decoder references
 

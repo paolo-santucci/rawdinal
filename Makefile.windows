@@ -1,0 +1,33 @@
+!IFNDEF CMAKE
+CMAKE = cmake
+!ENDIF
+!IFNDEF CARGO
+CARGO = cargo
+!ENDIF
+!IFNDEF CTEST
+CTEST = ctest
+!ENDIF
+!IFNDEF BUILD_DIR
+BUILD_DIR = build\windows
+!ENDIF
+!IFNDEF PREFIX
+PREFIX = $(MAKEDIR)\build\install
+!ENDIF
+
+all: build
+
+configure:
+	"$(CMAKE)" -S . -B "$(BUILD_DIR)" -G "NMake Makefiles" -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON -DRAWDINAL_INSTALL=ON -DRAWDINAL_CARGO:STRING="$(CARGO)"
+
+build: configure
+	"$(CMAKE)" --build "$(BUILD_DIR)" --config Release
+
+test: build
+	"$(CARGO)" test --workspace --locked
+	"$(CTEST)" --test-dir "$(BUILD_DIR)" -C Release --output-on-failure
+
+install: build
+	"$(CMAKE)" --install "$(BUILD_DIR)" --config Release --prefix "$(PREFIX)"
+
+clean:
+	if exist "$(BUILD_DIR)\CMakeCache.txt" "$(CMAKE)" --build "$(BUILD_DIR)" --target clean
