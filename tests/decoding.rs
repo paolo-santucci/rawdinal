@@ -531,7 +531,7 @@ fn parses_canonical_reference_manifest_and_rejects_invalid_manifests() {
 
 #[test]
 fn accepts_merrill_container_versions_but_rejects_tiny_geometry() {
-    for version in [0x30000, 0x30001] {
+    for version in [0x20003, 0x30000, 0x30001] {
         let mut header = vec![0; 40];
         header[..4].copy_from_slice(b"FOVb");
         put_u32(&mut header, 4, version);

@@ -21,7 +21,7 @@ pub struct X3f<'a> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SensorFormat {
-    /// X3F 3.0 or 3.1 with TRUE format `0x1e`.
+    /// X3F 2.3, 3.0 or 3.1 with RAW type 1 and TRUE format `0x1e`.
     Merrill,
     /// X3F 4.1 with TRUE format `0x23`.
     Quattro,
@@ -56,7 +56,7 @@ impl<'a> X3f<'a> {
         let version = file.u32(4)?;
         if !matches!(
             version,
-            0x0003_0000 | 0x0003_0001 | 0x0004_0001 | 0x0004_0002
+            0x0002_0003 | 0x0003_0000 | 0x0003_0001 | 0x0004_0001 | 0x0004_0002
         ) {
             return Err(invalid("unsupported X3F version"));
         }
@@ -132,7 +132,7 @@ impl<'a> X3f<'a> {
 
     pub fn sensor_format(&self) -> Result<SensorFormat> {
         match (self.version, self.raw.u32(12)?) {
-            (0x0003_0000 | 0x0003_0001, 0x1e) => Ok(SensorFormat::Merrill),
+            (0x0002_0003 | 0x0003_0000 | 0x0003_0001, 0x1e) => Ok(SensorFormat::Merrill),
             (0x0004_0001, 0x23) => Ok(SensorFormat::Quattro),
             (0x0004_0002, 0x25) => Ok(SensorFormat::SdQuattro),
             _ => Err(invalid(
