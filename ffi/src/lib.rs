@@ -27,7 +27,6 @@ pub struct Image {
 }
 
 #[repr(C)]
-#[derive(Default)]
 pub struct ClippingV1Plane {
     identity: u32,
     threshold_code: u32,
@@ -41,7 +40,6 @@ pub struct ClippingV1Plane {
 }
 
 #[repr(C)]
-#[derive(Default)]
 pub struct ClippingV1Info {
     version: u32,
     reserved: u32,
@@ -51,6 +49,37 @@ pub struct ClippingV1Info {
     byte_count: usize,
     data: *const u8,
     planes: [ClippingV1Plane; 3],
+}
+
+impl Default for ClippingV1Plane {
+    fn default() -> Self {
+        Self {
+            identity: 0,
+            threshold_code: 0,
+            threshold_provenance: 0,
+            reserved: 0,
+            width: 0,
+            height: 0,
+            stride_bytes: 0,
+            byte_count: 0,
+            data: ptr::null(),
+        }
+    }
+}
+
+impl Default for ClippingV1Info {
+    fn default() -> Self {
+        Self {
+            version: 0,
+            reserved: 0,
+            width: 0,
+            height: 0,
+            stride_bytes: 0,
+            byte_count: 0,
+            data: ptr::null(),
+            planes: Default::default(),
+        }
+    }
 }
 
 #[repr(C)]
