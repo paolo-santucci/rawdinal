@@ -12,6 +12,7 @@ struct Node {
 pub(crate) struct Codebook {
     nodes: Vec<Node>,
     prefixes: [(u8, u8); 256],
+    minimum_bits: u8,
 }
 
 pub(crate) struct Bits<'a> {
@@ -63,6 +64,7 @@ impl Codebook {
         let mut book = Self {
             nodes: vec![Node::default()],
             prefixes: [(0, 0); 256],
+            minimum_bits: u8::MAX,
         };
         for symbol in 0..=17 {
             let pair = data.bytes(*offset, 2)?;
@@ -106,8 +108,19 @@ impl Codebook {
             return Err(invalid("overlapping Huffman codes"));
         }
         self.nodes[index].symbol = Some(symbol);
+        self.minimum_bits = self.minimum_bits.min(length + symbol);
         for prefix in usize::from(code)..usize::from(code) + (1 << (8 - length)) {
             self.prefixes[prefix] = (length, symbol);
+        }
+        Ok(())
+    }
+
+    pub fn validate_capacity(&self, byte_count: usize, value_count: usize) -> Result<()> {
+        let bits = value_count
+            .checked_mul(usize::from(self.minimum_bits))
+            .ok_or_else(|| invalid("entropy capacity overflow"))?;
+        if bits.div_ceil(8) > byte_count {
+            return Err(invalid("declared output exceeds entropy capacity"));
         }
         Ok(())
     }
@@ -154,6 +167,22 @@ mod tests {
     fn rejects_truncated_stream() {
         let book = Codebook::parse(Reader(&[1, 0, 1, 128, 0, 0]), &mut 0).unwrap();
         assert!(book.difference(&mut Bits::new(&[])).is_err());
+    }
+
+    #[test]
+    fn rejects_invalid_codebooks_and_undefined_prefixes() {
+        for table in [
+            &[0, 0][..],
+            &[9, 0, 0, 0],
+            &[1, 1, 0, 0],
+            &[1, 0, 1, 0, 0, 0],
+            &[2, 0, 1, 0, 0, 0],
+            &[1, 0],
+        ] {
+            assert!(Codebook::parse(Reader(table), &mut 0).is_err());
+        }
+        let book = Codebook::parse(Reader(&[1, 0, 0, 0]), &mut 0).unwrap();
+        assert!(book.difference(&mut Bits::new(&[128])).is_err());
     }
 
     #[test]

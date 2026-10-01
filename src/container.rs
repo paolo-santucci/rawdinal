@@ -230,14 +230,28 @@ impl<'a> X3f<'a> {
             self.raw.size(offset + 8)?,
         ];
         offset += 12;
+        let mut streams = [&[][..]; 3];
+        for channel in 0..3 {
+            streams[channel] = self.raw.bytes(offset, lengths[channel])?;
+            let (width, height) = dimensions[channel];
+            validate_plane_capacity(streams[channel], &book, width, height)?;
+            let padded = lengths[channel]
+                .checked_add(15)
+                .ok_or_else(|| invalid("plane length overflow"))?
+                & !15;
+            offset = offset
+                .checked_add(padded)
+                .ok_or_else(|| invalid("plane offset overflow"))?;
+        }
         let mut layers = Vec::new();
         for (channel, &(width, height)) in dimensions.iter().enumerate() {
-            let data = self.raw.bytes(offset, lengths[channel])?;
             let seed = self.raw.u16(seeds_offset + 2 * channel)?;
-            layers.push(decode_plane(data, &book, (width, height), seed)?);
-            offset = offset
-                .checked_add((lengths[channel] + 15) & !15)
-                .ok_or_else(|| invalid("plane offset overflow"))?;
+            layers.push(decode_plane(
+                streams[channel],
+                &book,
+                (width, height),
+                seed,
+            )?);
         }
         let layers = layers
             .try_into()
@@ -275,19 +289,29 @@ fn validate_geometry(
     Ok(())
 }
 
+fn validate_plane_capacity(
+    bytes: &[u8],
+    book: &Codebook,
+    width: usize,
+    height: usize,
+) -> Result<usize> {
+    let count = width
+        .checked_mul(height)
+        .ok_or_else(|| invalid("plane dimensions overflow"))?;
+    if width < 2 || height < 2 || count > MAX_PLANE_SAMPLES {
+        return Err(invalid("plane dimensions outside supported limits"));
+    }
+    book.validate_capacity(bytes.len(), count)?;
+    Ok(count)
+}
+
 fn decode_plane(
     bytes: &[u8],
     book: &Codebook,
     (width, height): (usize, usize),
     seed: u16,
 ) -> Result<Plane> {
-    let count = width
-        .checked_mul(height)
-        .ok_or_else(|| invalid("plane dimensions overflow"))?;
-    if width < 2 || height < 2 || count > MAX_PLANE_SAMPLES || count > bytes.len().saturating_mul(8)
-    {
-        return Err(invalid("plane dimensions outside supported limits"));
-    }
+    let count = validate_plane_capacity(bytes, book, width, height)?;
     let mut samples = zeroed(count)?;
     let mut bits = Bits::new(bytes);
     let mut row_start = [[i32::from(seed); 2]; 2];
@@ -338,6 +362,69 @@ mod tests {
     fn rejects_predictors_outside_the_sensor_sample_range() {
         let book = Codebook::parse(Reader(&[1, 0, 1, 128, 0, 0]), &mut 0).unwrap();
         assert!(decode_plane(&[255], &book, (2, 2), 65535).is_err());
+    }
+
+    #[test]
+    fn rejects_predictor_underflow() {
+        let book = Codebook::parse(Reader(&[1, 0, 1, 128, 0, 0]), &mut 0).unwrap();
+        assert!(decode_plane(&[0b1000_0000], &book, (2, 2), 0).is_err());
+    }
+
+    #[test]
+    fn rejects_impossible_entropy_capacity_before_decoding() {
+        let book = Codebook::parse(Reader(&[8, 0, 0, 0]), &mut 0).unwrap();
+        assert_eq!(
+            decode_plane(&[255], &book, (2, 2), 0)
+                .unwrap_err()
+                .to_string(),
+            "declared output exceeds entropy capacity"
+        );
+    }
+
+    #[test]
+    fn rejects_plane_dimension_overflow() {
+        let book = Codebook::parse(Reader(&[1, 0, 0, 0]), &mut 0).unwrap();
+        for dimensions in [(0, 2), (1, 2), (usize::MAX, 2), (2, usize::MAX)] {
+            assert!(decode_plane(&[0; 8], &book, dimensions, 0).is_err());
+        }
+    }
+
+    #[test]
+    fn rejects_entropy_truncated_inside_the_last_difference() {
+        let book = Codebook::parse(Reader(&[1, 0, 1, 128, 0, 0]), &mut 0).unwrap();
+        assert_eq!(
+            decode_plane(&[1], &book, (4, 2), 100)
+                .unwrap_err()
+                .to_string(),
+            "truncated entropy stream"
+        );
+    }
+
+    #[test]
+    fn entropy_mutations_reach_the_plane_decoder_without_panics() {
+        let mut state = 0x8d26_51f3u32;
+        let mut next_byte = || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state as u8
+        };
+        for _ in 0..4096 {
+            let mut table = [0u8; 36];
+            for symbol in 0..17 {
+                table[2 * symbol] = 8;
+                table[2 * symbol + 1] = symbol as u8;
+            }
+            let offset = usize::from(next_byte()) % table.len();
+            table[offset] = next_byte();
+            if let Ok(book) = Codebook::parse(Reader(&table), &mut 0) {
+                let mut stream = [0; 192];
+                for byte in &mut stream {
+                    *byte = next_byte();
+                }
+                let _ = decode_plane(&stream, &book, (8, 8), 32768);
+            }
+        }
     }
 
     #[test]
