@@ -1893,6 +1893,112 @@ mod tests {
         assert!(image.is_null());
     }
 
+    fn truncated_x3f_fixture() -> Vec<u8> {
+        let mut bytes = vec![0; 209];
+        bytes[..4].copy_from_slice(b"FOVb");
+        bytes[40..44].copy_from_slice(b"SECc");
+        bytes[68] = 1;
+        bytes[101..105].copy_from_slice(b"SECi");
+        bytes[149] = 1;
+        bytes[169..173].copy_from_slice(b"SECd");
+        bytes[189..193].copy_from_slice(b"CAMF");
+        bytes[201..205].copy_from_slice(b"IMA2");
+        for (offset, value) in [
+            (4, 0x40002u32),
+            (44, 0x20000),
+            (48, 5),
+            (52, 8),
+            (96, 1),
+            (105, 0x20000),
+            (109, 1),
+            (113, 0x25),
+            (117, 5888),
+            (121, 3776),
+            (173, 0x20000),
+            (177, 2),
+            (181, 40),
+            (185, 61),
+            (193, 101),
+            (197, 68),
+            (205, 169),
+        ] {
+            bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        for (offset, value) in [
+            (129, 2944u16),
+            (131, 1888),
+            (133, 2944),
+            (135, 1888),
+            (137, 5888),
+            (139, 3776),
+        ] {
+            bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+        }
+        bytes
+    }
+
+    fn assert_x3f_decode_failure(bytes: &[u8]) {
+        let mut sensor = ptr::NonNull::<SensorImage>::dangling().as_ptr();
+        let mut error = [b'x' as c_char; 5];
+        let status = unsafe {
+            rawdinal_sensor_v1_decode(
+                bytes.as_ptr(),
+                bytes.len(),
+                &mut sensor,
+                error.as_mut_ptr(),
+                error.len(),
+            )
+        };
+        assert_eq!((status, sensor.is_null(), error[4]), (1, true, 0));
+        for decode in [rawdinal_decode, rawdinal_decode_with_clipping_v1] {
+            let mut image = ptr::NonNull::<Image>::dangling().as_ptr();
+            let mut info = ImageInfo {
+                width: 123,
+                height: 456,
+                exif: bytes.as_ptr(),
+                exif_size: bytes.len(),
+            };
+            error.fill(b'x' as c_char);
+            let status = unsafe {
+                decode(
+                    bytes.as_ptr(),
+                    bytes.len(),
+                    &mut image,
+                    &mut info,
+                    error.as_mut_ptr(),
+                    error.len(),
+                )
+            };
+            assert_eq!((status, image.is_null(), error[4]), (1, true, 0));
+            assert_eq!(
+                (info.width, info.height, info.exif.is_null(), info.exif_size),
+                (0, 0, true, 0)
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_x3f_bytes_return_input_errors_and_clear_ffi_outputs() {
+        let original = truncated_x3f_fixture();
+        assert_x3f_decode_failure(&original);
+        for length in 0..original.len() {
+            assert_x3f_decode_failure(&original[..length]);
+        }
+        for offset in 0..original.len() {
+            for value in [0, 1, 127, 255] {
+                let mut bytes = original.clone();
+                bytes[offset] = value;
+                assert_x3f_decode_failure(&bytes);
+                let mut preview = bytes.as_ptr();
+                let mut length = bytes.len();
+                let status = unsafe {
+                    rawdinal_preview(bytes.as_ptr(), bytes.len(), &mut preview, &mut length)
+                };
+                assert_eq!((status, preview.is_null(), length), (1, true, 0));
+            }
+        }
+    }
+
     #[test]
     fn sensor_handle_allows_empty_exif() {
         let image = sensor_handle(Vec::new());

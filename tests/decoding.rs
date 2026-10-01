@@ -496,6 +496,146 @@ fn padded_quattro_raw_section() -> Vec<u8> {
     section
 }
 
+fn native_raw_section(format: u32) -> (Vec<u8>, [usize; 3], usize) {
+    let (dimensions, image) = match format {
+        0x1e => ([(4928u16, 3264u16); 3], (4928, 3264)),
+        0x23 => ([(2944, 1836), (2944, 1836), (6272, 3672)], (5888, 3672)),
+        0x25 => ([(2944, 1888), (2944, 1888), (5888, 3776)], (5888, 3776)),
+        0x27 => ([(3328, 2240), (3328, 2240), (6656, 4480)], (6656, 4480)),
+        _ => panic!("unexpected test format"),
+    };
+    let (mut raw, lengths_offset) = if format == 0x1e {
+        (merrill_raw_section(), 40)
+    } else {
+        (raw_section(), 56)
+    };
+    raw.truncate(lengths_offset + 12);
+    put_u32(&mut raw, 12, format as usize);
+    put_u32(&mut raw, 16, image.0);
+    put_u32(&mut raw, 20, image.1);
+    let mut offsets = [0; 3];
+    for (channel, (width, height)) in dimensions.into_iter().enumerate() {
+        if format != 0x1e {
+            raw[28 + 4 * channel..30 + 4 * channel].copy_from_slice(&width.to_le_bytes());
+            raw[30 + 4 * channel..32 + 4 * channel].copy_from_slice(&height.to_le_bytes());
+        }
+        let length = (usize::from(width) * usize::from(height)).div_ceil(8);
+        put_u32(&mut raw, lengths_offset + 4 * channel, length);
+        offsets[channel] = raw.len();
+        raw.resize(raw.len() + length.next_multiple_of(16), 0);
+    }
+    raw[offsets[0]] = 128;
+    (raw, offsets, lengths_offset)
+}
+
+#[test]
+fn native_geometry_reaches_entropy_validation_for_every_supported_format() {
+    for (version, format) in [
+        (0x20003, 0x1e),
+        (0x40001, 0x23),
+        (0x40002, 0x25),
+        (0x40002, 0x27),
+    ] {
+        let (raw, _, _) = native_raw_section(format);
+        let mut header = quattro_header();
+        put_u32(&mut header, 4, version);
+        let bytes = fixture_parts(header, calibration_section(), raw);
+        assert_eq!(
+            X3f::parse(&bytes)
+                .unwrap()
+                .decode()
+                .unwrap_err()
+                .to_string(),
+            "undefined Huffman code"
+        );
+    }
+}
+
+#[test]
+fn rejects_late_plane_truncation_before_decoding_the_first_plane() {
+    let (mut raw, _, lengths_offset) = native_raw_section(0x25);
+    raw.pop();
+    let bytes = fixture_parts(quattro_header(), calibration_section(), raw);
+    assert_eq!(
+        X3f::parse(&bytes)
+            .unwrap()
+            .decode()
+            .unwrap_err()
+            .to_string(),
+        "truncated data"
+    );
+
+    let (mut raw, _, _) = native_raw_section(0x25);
+    put_u32(&mut raw, lengths_offset + 8, 0);
+    let bytes = fixture_parts(quattro_header(), calibration_section(), raw);
+    assert_eq!(
+        X3f::parse(&bytes)
+            .unwrap()
+            .decode()
+            .unwrap_err()
+            .to_string(),
+        "declared output exceeds entropy capacity"
+    );
+}
+
+#[test]
+fn rejects_truncated_sections_even_with_an_intact_directory() {
+    let camf = calibration_section();
+    for length in 0..camf.len() {
+        let bytes = fixture_parts(quattro_header(), camf[..length].to_vec(), raw_section());
+        assert!(
+            X3f::parse(&bytes)
+                .and_then(|file| file.calibration())
+                .is_err()
+        );
+    }
+    let (raw, _, lengths_offset) = native_raw_section(0x25);
+    for length in 0..lengths_offset + 12 {
+        let bytes = fixture_parts(quattro_header(), camf.clone(), raw[..length].to_vec());
+        assert!(X3f::parse(&bytes).and_then(|file| file.decode()).is_err());
+    }
+}
+
+#[test]
+fn rejects_hostile_section_ranges_and_directory_counts() {
+    let original = fixture();
+    let directory = original.len() - 40;
+    for (offset, value) in [
+        (directory + 8, u32::MAX as usize),
+        (directory + 12, 39),
+        (directory + 12, directory),
+        (directory + 12, u32::MAX as usize),
+        (directory + 16, u32::MAX as usize),
+        (directory + 24, directory - 1),
+        (directory + 28, 0),
+        (original.len() - 4, u32::MAX as usize),
+    ] {
+        let mut bytes = original.clone();
+        put_u32(&mut bytes, offset, value);
+        assert!(
+            X3f::parse(&bytes).is_err(),
+            "offset={offset}, value={value}"
+        );
+    }
+}
+
+#[test]
+fn rejects_camf_expansion_bombs_and_hostile_stream_lengths() {
+    for (offset, value) in [
+        (12, 0),
+        (12, 32 * 1024 * 1024 + 1),
+        (12, u32::MAX as usize),
+        (56, u32::MAX as usize),
+    ] {
+        let mut camf = calibration_section();
+        put_u32(&mut camf, offset, value);
+        let bytes = fixture_parts(quattro_header(), camf, raw_section());
+        let file = X3f::parse(&bytes).unwrap();
+        assert!(file.camf_bytes().is_err());
+        assert!(file.calibration().is_err());
+    }
+}
+
 #[test]
 fn rejects_tiny_synthetic_quattro_geometry() {
     let bytes = fixture();
@@ -719,8 +859,49 @@ fn single_byte_mutations_do_not_panic() {
             let mut bytes = original.clone();
             bytes[index] = replacement;
             if let Ok(file) = X3f::parse(&bytes) {
-                let _ = file.calibration();
+                if let Ok(calibration) = file.calibration() {
+                    let _ = file.white_balance(&calibration);
+                }
+                let _ = file.camf_bytes();
+                let _ = file.exif();
+                let _ = file.preview();
+                let _ = file.sensor_format();
                 let _ = file.decode();
+            }
+        }
+    }
+}
+
+#[test]
+fn deterministic_multi_byte_mutations_never_panic() {
+    let original = fixture_sections(
+        quattro_header(),
+        vec![
+            (*b"CAMF", calibration_section()),
+            (*b"IMA2", raw_section()),
+            (
+                *b"IMA2",
+                jpeg_section(b"\xff\xd8\xff\xe1\x00\x08Exif\0\0\xff\xd9"),
+            ),
+        ],
+    );
+    let mut state = 0xa537_6b19u32;
+    for _ in 0..4096 {
+        let mut bytes = original.clone();
+        for _ in 0..4 {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            let index = state as usize % bytes.len();
+            bytes[index] ^= (state >> 24) as u8;
+        }
+        let _ = rawdinal::probe(&bytes, rawdinal::DecodeLimits::default());
+        if let Ok(file) = X3f::parse(&bytes) {
+            let _ = file.decode();
+            let _ = file.camf_bytes();
+            let _ = file.exif();
+            if let Ok(calibration) = file.calibration() {
+                let _ = file.white_balance(&calibration);
             }
         }
     }

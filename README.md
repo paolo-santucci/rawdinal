@@ -64,6 +64,16 @@ X3F_PIXLS_REFERENCE_DIR=.opencode/x3f-references/raw-pixls-us \
 
 `rawdinal_preview` returns storage borrowed from the input buffer. `rawdinal_decode` returns an owned opaque image handle whose EXIF pointer remains valid until `rawdinal_free`. `rawdinal_decode_with_clipping_v1` additionally retains output and bottom/middle/top native masks borrowed through `rawdinal_get_clipping_v1` until `rawdinal_free`; threshold flags identify estimated encoded maxima, not calibrated physical saturation. `rawdinal_copy_rgba` copies unbounded linear-sRGB RGBA values into caller-owned storage. `rawdinal_sensor_v1_decode` owns decoded physical planes plus copied EXIF and decompressed CAMF; its getters borrow those buffers until `rawdinal_sensor_v1_free`.
 
+## Malformed X3F input
+
+The X3F parser limits input to 512 MiB and 64 non-overlapping sections. Decoding accepts only the sensor geometries listed above. Before allocating sensor planes, it checks every plane's byte range and whether its entropy stream can hold the declared samples. Invalid Huffman codes, truncated differences and out-of-range predictors return errors.
+
+CAMF decompression is capped at 32 MiB. Calibration parsing also limits expanded matrix values to 32 MiB in total, with at most 4,096 entries, 4,096 properties per entry, 65,536 properties across all entries and a 4 MiB aggregate property-string budget, including terminators. Matrix payloads and property strings must follow their descriptors and offset tables. These bounds cover individual decoding operations, not total process memory or concurrent callers.
+
+The default test suite exercises truncated sections with intact directories, hostile offsets and lengths, metadata expansion limits, malformed JPEG/EXIF and deterministic byte mutations. Native-size fixtures reach RAW entropy validation for every supported format. C-interface regressions check that malformed inputs return an input error rather than a caught panic, clear image outputs and terminate error messages.
+
+Validation is staged: `X3f::parse` checks the container; `decode`, `calibration` and metadata accessors validate the data they consume. `preview` borrows JPEG bytes without validating the whole JPEG, and `camf_bytes` decompresses CAMF without interpreting its entries. The sensor C API likewise returns uninterpreted CAMF and treats unreadable optional EXIF as absent. Successful decoding cannot detect every byte alteration that still describes valid samples or metadata. The mutation tests are regression coverage, not an exhaustive fuzzing or security guarantee.
+
 ## License
 
 Copyright (C) 2026 Paolo SANTUCCI
