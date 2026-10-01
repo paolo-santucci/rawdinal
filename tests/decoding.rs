@@ -295,6 +295,14 @@ fn assert_matches_independent_reference(sample: &Path, reference_directory: &Pat
         sample.display()
     );
     assert_eq!(calibration, reference, "{}: CAMF", sample.display());
+    let metadata = file
+        .calibration()
+        .unwrap_or_else(|error| panic!("{}: {error}", sample.display()));
+    assert!(
+        !metadata.entries.is_empty(),
+        "{}: empty CAMF entries",
+        sample.display()
+    );
     let image = file
         .decode()
         .unwrap_or_else(|error| panic!("{}: {error}", sample.display()));
@@ -725,6 +733,53 @@ fn sample_matches_independent_reference_byte_for_byte() {
     let reference_directory =
         PathBuf::from(std::env::var_os("X3F_REFERENCE_DIR").expect("X3F_REFERENCE_DIR"));
     let _ = assert_matches_independent_reference(&sample, &reference_directory);
+}
+
+#[test]
+#[ignore = "requires X3F_PIXLS_SAMPLE_DIR and X3F_PIXLS_REFERENCE_DIR with the raw.pixls.us Sigma corpus"]
+fn pixls_corpus_matches_independent_references_and_rejects_unsupported_formats() {
+    let samples =
+        PathBuf::from(std::env::var_os("X3F_PIXLS_SAMPLE_DIR").expect("X3F_PIXLS_SAMPLE_DIR"));
+    let references = PathBuf::from(
+        std::env::var_os("X3F_PIXLS_REFERENCE_DIR").expect("X3F_PIXLS_REFERENCE_DIR"),
+    );
+    let cases = [
+        ("DP0 Quattro/_SDI0263.X3F", Some(0x0001_0023)),
+        ("DP1/RAW_SIGMA_DP1.X3F", None),
+        ("DP1 Merrill/SDIM0555.X3F", Some(0x0001_001e)),
+        ("DP3 Merrill/_P3M9383.X3F", Some(0x0001_001e)),
+        ("SIGMA DP2 Merrill/DP2M1726.X3F", Some(0x0001_001e)),
+        ("SIGMA DP2 Merrill/DP2M5265.X3F", Some(0x0001_001e)),
+        ("SIGMA DP2 Merrill/SDIM0076.X3F", Some(0x0001_001e)),
+        ("SIGMA DP2 Merrill/SDIM1223.X3F", Some(0x0001_001e)),
+        ("SIGMA SD1 Merrill/SDIM0042.X3F", Some(0x0001_001e)),
+        ("SIGMA SD14/20120818-SDIM4579.X3F", None),
+        ("SIGMA SD15/_SDI5651.X3F", None),
+        ("SIGMA dp2 Quattro/SDIM4388.X3F", Some(0x0001_0023)),
+        ("Sigma DP1s/RAW_SIGMA_DP1S.X3F", None),
+        ("Sigma SD9/RAW_SIGMA_SD9_SRGB.X3F", None),
+        ("Sigma SD10/RAW_SIGMA_SD10.X3F", None),
+        ("sd Quattro/sample3.X3F", Some(0x0001_0025)),
+        ("sd Quattro H/SDIM0061.X3F", Some(0x0001_0027)),
+    ];
+    for (relative, expected) in cases {
+        let sample = samples.join(relative);
+        if let Some(format) = expected {
+            let reference = references.join(relative).with_extension("");
+            assert_eq!(
+                assert_matches_independent_reference(&sample, &reference),
+                format
+            );
+            eprintln!("{relative}: matches independent planes and CAMF");
+        } else {
+            let bytes = read_fixture(&sample);
+            assert!(
+                X3f::parse(&bytes).and_then(|file| file.decode()).is_err(),
+                "{relative}"
+            );
+            eprintln!("{relative}: unsupported format rejected");
+        }
+    }
 }
 
 #[test]
