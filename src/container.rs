@@ -25,7 +25,7 @@ pub enum SensorFormat {
     Merrill,
     /// X3F 4.1 with TRUE format `0x23`.
     Quattro,
-    /// X3F 4.2 with TRUE format `0x25`.
+    /// X3F 4.2 with TRUE format `0x25` (sd Quattro) or `0x27` (sd Quattro H).
     SdQuattro,
 }
 
@@ -134,7 +134,7 @@ impl<'a> X3f<'a> {
         match (self.version, self.raw.u32(12)?) {
             (0x0002_0003 | 0x0003_0000 | 0x0003_0001, 0x1e) => Ok(SensorFormat::Merrill),
             (0x0004_0001, 0x23) => Ok(SensorFormat::Quattro),
-            (0x0004_0002, 0x25) => Ok(SensorFormat::SdQuattro),
+            (0x0004_0002, 0x25 | 0x27) => Ok(SensorFormat::SdQuattro),
             _ => Err(invalid(
                 "unsupported X3F version and TRUE format combination",
             )),
@@ -217,7 +217,7 @@ impl<'a> X3f<'a> {
                 (encoded, 40, 48, true)
             }
         };
-        validate_geometry(format, dimensions, image_dimensions)?;
+        validate_geometry(self.raw.u32(12)?, dimensions, image_dimensions)?;
         let book = Codebook::parse(self.raw, &mut offset)?;
         if has_quattro_marker {
             offset = offset
@@ -258,17 +258,19 @@ impl<'a> X3f<'a> {
 }
 
 fn validate_geometry(
-    format: SensorFormat,
+    raw_format: u32,
     encoded: [(usize, usize); 3],
     image: (usize, usize),
 ) -> Result<()> {
-    let expected = match format {
-        SensorFormat::Merrill => ([(4928, 3264); 3], (4928, 3264)),
-        SensorFormat::Quattro => ([(2944, 1836), (2944, 1836), (6272, 3672)], (5888, 3672)),
-        SensorFormat::SdQuattro => ([(2944, 1888), (2944, 1888), (5888, 3776)], (5888, 3776)),
+    let expected = match raw_format {
+        0x1e => ([(4928, 3264); 3], (4928, 3264)),
+        0x23 => ([(2944, 1836), (2944, 1836), (6272, 3672)], (5888, 3672)),
+        0x25 => ([(2944, 1888), (2944, 1888), (5888, 3776)], (5888, 3776)),
+        0x27 => ([(3328, 2240), (3328, 2240), (6656, 4480)], (6656, 4480)),
+        _ => return Err(invalid("unsupported TRUE format")),
     };
     if (encoded, image) != expected {
-        return Err(invalid("unsupported Quattro layer geometry"));
+        return Err(invalid("unsupported sensor layer geometry"));
     }
     Ok(())
 }
@@ -340,10 +342,10 @@ mod tests {
 
     #[test]
     fn accepts_only_observed_sensor_geometries() {
-        assert!(validate_geometry(SensorFormat::Merrill, [(4928, 3264); 3], (4928, 3264)).is_ok());
+        assert!(validate_geometry(0x1e, [(4928, 3264); 3], (4928, 3264)).is_ok());
         assert!(
             validate_geometry(
-                SensorFormat::Quattro,
+                0x23,
                 [(2944, 1836), (2944, 1836), (6272, 3672)],
                 (5888, 3672)
             )
@@ -351,7 +353,7 @@ mod tests {
         );
         assert!(
             validate_geometry(
-                SensorFormat::SdQuattro,
+                0x25,
                 [(2944, 1888), (2944, 1888), (5888, 3776)],
                 (5888, 3776)
             )
@@ -359,12 +361,31 @@ mod tests {
         );
         assert!(
             validate_geometry(
-                SensorFormat::Quattro,
+                0x23,
                 [(2944, 1836), (2944, 1836), (5888, 3672)],
                 (5888, 3672)
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn accepts_quattro_h_geometry_only_for_its_true_format() {
+        let layers = [(3328, 2240), (3328, 2240), (6656, 4480)];
+        assert!(validate_geometry(0x27, layers, (6656, 4480)).is_ok());
+        for format in [0x1e, 0x23, 0x25, 0x99] {
+            assert!(validate_geometry(format, layers, (6656, 4480)).is_err());
+        }
+        for channel in 0..3 {
+            let mut invalid = layers;
+            invalid[channel].0 += 1;
+            assert!(validate_geometry(0x27, invalid, (6656, 4480)).is_err());
+            invalid = layers;
+            invalid[channel].1 += 1;
+            assert!(validate_geometry(0x27, invalid, (6656, 4480)).is_err());
+        }
+        assert!(validate_geometry(0x27, layers, (6655, 4480)).is_err());
+        assert!(validate_geometry(0x27, layers, (6656, 4479)).is_err());
     }
 
     #[test]

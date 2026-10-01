@@ -136,6 +136,7 @@ static int select_planes(x3f_image_data_t *image, plane_source_t planes[TRUE_PLA
       break;
     case X3F_IMAGE_RAW_QUATTRO:
     case X3F_IMAGE_RAW_SDQ:
+    case X3F_IMAGE_RAW_SDQH:
       if(image->quattro == NULL || !image->quattro->quattro_layout)
         return fail("missing split-resolution Quattro decoder output");
       *expected_camf_type = 5;

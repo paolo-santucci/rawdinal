@@ -224,7 +224,7 @@ fn sample_metadata(bytes: &[u8]) -> Result<(u32, u32, u32), String> {
 fn assert_plane_sources(manifest: &ReferenceManifest, sample: &Path) {
     let expected = match manifest.raw_type_format {
         0x0001_001e => [("x3rgb16", 0), ("x3rgb16", 1), ("x3rgb16", 2)],
-        0x0001_0023 | 0x0001_0025 => [("x3rgb16", 0), ("x3rgb16", 1), ("top16", 0)],
+        0x0001_0023 | 0x0001_0025 | 0x0001_0027 => [("x3rgb16", 0), ("x3rgb16", 1), ("top16", 0)],
         format => panic!("unsupported reference RAW format: {format:#x}"),
     };
     for (index, (plane, (source, component))) in manifest.layers.iter().zip(expected).enumerate() {
@@ -538,6 +538,49 @@ fn accepts_merrill_container_versions_but_rejects_tiny_geometry() {
         let bytes = fixture_parts(header, calibration_section(), merrill_raw_section());
         let file = X3f::parse(&bytes).unwrap();
         assert_eq!(file.sensor_format().unwrap(), SensorFormat::Merrill);
+        assert!(file.decode().is_err());
+    }
+}
+
+#[test]
+fn recognizes_sd_quattro_h_but_rejects_sd_quattro_geometry() {
+    let mut raw = raw_section();
+    put_u32(&mut raw, 12, 0x27);
+    put_u32(&mut raw, 16, 5888);
+    put_u32(&mut raw, 20, 3776);
+    for (channel, (width, height)) in [(2944u16, 1888u16), (2944, 1888), (5888, 3776)]
+        .into_iter()
+        .enumerate()
+    {
+        raw[28 + 4 * channel..30 + 4 * channel].copy_from_slice(&width.to_le_bytes());
+        raw[30 + 4 * channel..32 + 4 * channel].copy_from_slice(&height.to_le_bytes());
+    }
+    let bytes = fixture_parts(quattro_header(), calibration_section(), raw);
+    let file = X3f::parse(&bytes).unwrap();
+    assert_eq!(file.sensor_format().unwrap(), SensorFormat::SdQuattro);
+    assert!(file.calibration().is_ok());
+    assert_eq!(
+        file.decode().unwrap_err().to_string(),
+        "unsupported sensor layer geometry"
+    );
+}
+
+#[test]
+fn rejects_unobserved_version_and_true_format_pairs() {
+    for (version, format) in [
+        (0x20003, 0x23),
+        (0x20003, 0x27),
+        (0x40001, 0x27),
+        (0x40002, 0x1e),
+    ] {
+        let mut raw = raw_section();
+        put_u32(&mut raw, 12, format);
+        let mut header = quattro_header();
+        put_u32(&mut header, 4, version);
+        let bytes = fixture_parts(header, calibration_section(), raw);
+        let file = X3f::parse(&bytes).unwrap();
+        assert!(file.sensor_format().is_err());
+        assert!(file.camf_bytes().is_err());
         assert!(file.decode().is_err());
     }
 }
