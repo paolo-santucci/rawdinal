@@ -131,6 +131,68 @@ typedef struct rawdinal_raw_v1_capabilities
   uint32_t reserved2;
 } rawdinal_raw_v1_capabilities;
 
+#define RAWDINAL_RAW_V1_CODEC_UNCOMPRESSED UINT32_C(3)
+#define RAWDINAL_RAW_V1_CODEC_LOSSY_JPEG UINT32_C(4)
+#define RAWDINAL_RAW_V1_CODEC_BIT_UNCOMPRESSED UINT32_C(4)
+#define RAWDINAL_RAW_V1_CODEC_BIT_LOSSY_JPEG UINT32_C(8)
+#define RAWDINAL_RAW_V1_PROCESSING_PARTIALLY_APPLIED UINT32_C(5)
+#define RAWDINAL_RAW_V1_RETAIN_ENCODED UINT32_C(1)
+#define RAWDINAL_RAW_V1_RETAIN_FLAGS UINT32_C(2)
+#define RAWDINAL_RAW_V1_DECODE_MASKS UINT32_C(4)
+#define RAWDINAL_RAW_V1_SAMPLE_ENCODED_MAXIMUM UINT8_C(1)
+#define RAWDINAL_RAW_V1_SAMPLE_DECLARED_WHITE UINT8_C(2)
+#define RAWDINAL_RAW_V1_SAMPLE_OUTSIDE_ACTIVE UINT8_C(4)
+#define RAWDINAL_RAW_V1_SAMPLE_OPCODE_PROCESSED UINT8_C(8)
+
+typedef struct rawdinal_raw_v1_metadata
+{
+  uint32_t version;
+  uint32_t root_offset;
+  uint32_t raw_offset;
+  uint32_t valid_area[4];
+  uint32_t crop_origin_present;
+  uint32_t crop_size_present;
+  double crop_origin[2];
+  double crop_size[2];
+  size_t directory_count;
+  const uint16_t *encoded_samples;
+  size_t encoded_sample_count;
+  const uint8_t *sample_flags;
+  size_t sample_flag_count;
+  size_t mask_count;
+} rawdinal_raw_v1_metadata;
+
+typedef struct rawdinal_raw_v1_directory
+{
+  uint32_t offset;
+  uint32_t parent_offset;
+  size_t tag_count;
+} rawdinal_raw_v1_directory;
+
+typedef struct rawdinal_raw_v1_tag
+{
+  uint16_t id;
+  uint16_t field_type;
+  uint32_t count;
+  const uint8_t *data;
+  size_t byte_count;
+} rawdinal_raw_v1_tag;
+
+typedef struct rawdinal_raw_v1_mask
+{
+  uint32_t ifd_offset;
+  uint32_t width;
+  uint32_t height;
+  uint32_t sub_area_present;
+  uint32_t sub_area[4];
+  const uint8_t *name;
+  size_t name_length;
+  const uint8_t *instance_id;
+  size_t instance_id_length;
+  const uint8_t *samples;
+  size_t sample_count;
+} rawdinal_raw_v1_mask;
+
 typedef uint32_t rawdinal_sensor_v1_plane_id;
 
 #define RAWDINAL_SENSOR_V1_BOTTOM UINT32_C(0)
@@ -274,9 +336,11 @@ int32_t rawdinal_raw_v1_decode(const uint8_t *data, size_t length,
  * include such a byte. tiff_byte_order interprets ProfileGainTableMap bytes. Presence fields make
  * optional values meaningful; absent colorimetric_reference defaults to SCENE_REFERRED.
  * Processing values use RAWDINAL_RAW_V1_PROCESSING_* and classification fields use
- * RAWDINAL_RAW_V1_TRUE/FALSE. Raw-v1 does not retain the full DNG metadata graph: callers retain
- * and reparse their original DNG bytes for WB, calibration, EXIF, and other metadata according to
- * processing flags. All borrowed pointers expire with the handle. The handle must not be accessed
+ * RAWDINAL_RAW_V1_TRUE/FALSE. Scoped TIFF metadata, including calibration and EXIF fields, is
+ * available through rawdinal_raw_v1_get_metadata/get_directory/get_tag. Private embedded offsets
+ * may still require the original file. Fractional crop values are available through get_metadata;
+ * the integer fields are absent when a value is fractional. All borrowed pointers expire with
+ * the handle. The handle must not be accessed
  * or released concurrently, and output must be writable and disjoint from handle-owned storage.
  * Output is zeroed on failure. */
 int32_t rawdinal_raw_v1_get_info(const rawdinal_raw_v1_image *image,
@@ -295,6 +359,34 @@ int32_t rawdinal_raw_v1_get_capabilities(rawdinal_raw_v1_capabilities *output);
 
 /** Release a raw-v1 handle exactly once after all descriptor reads. Null is accepted. */
 void rawdinal_raw_v1_free(rawdinal_raw_v1_image *image);
+
+/** Extended decoding has the same ownership contract as rawdinal_raw_v1_decode.
+ * Flags are RETAIN_ENCODED, RETAIN_FLAGS and DECODE_MASKS, ORed together; other bits are invalid.
+ * Encoded samples precede list 1. Sample flags describe encoded maxima/declared white, never
+ * measured photosite saturation. OPCODE_PROCESSED conservatively marks the whole image. */
+int32_t rawdinal_raw_v1_decode_extended(const uint8_t *data, size_t length, uint32_t flags,
+                                      rawdinal_raw_v1_image **output, char *error, size_t error_capacity);
+
+/** Metadata getters borrow handle-owned arrays until rawdinal_raw_v1_free. Outputs must be
+ * writable and disjoint from handle storage and are zeroed on error. The handle must remain live
+ * and cannot be accessed or freed concurrently. Directory and tag indices are zero-based.
+ * Metadata root/raw offsets identify scope; fields from previews are never substituted for them.
+ * valid_area is half-open stored-image coordinates. Crop doubles preserve rational fractions.
+ * Mask sub_area is [top,left,full_width,full_height], not a bottom/right rectangle. Masks are
+ * untransformed uint8 weights; dividing by 255 yields unit weights, with no gamma conversion. */
+int32_t rawdinal_raw_v1_get_metadata(const rawdinal_raw_v1_image *image, rawdinal_raw_v1_metadata *output);
+int32_t rawdinal_raw_v1_get_directory(const rawdinal_raw_v1_image *image, size_t index,
+                                     rawdinal_raw_v1_directory *output);
+int32_t rawdinal_raw_v1_get_tag(const rawdinal_raw_v1_image *image, size_t directory, size_t index,
+                               rawdinal_raw_v1_tag *output);
+int32_t rawdinal_raw_v1_get_mask(const rawdinal_raw_v1_image *image, size_t index,
+                                rawdinal_raw_v1_mask *output);
+
+/** Copy a numeric TIFF tag as doubles. Count must exactly match the tag's component count.
+ * Output must reference count writable doubles disjoint from the handle and remains untouched
+ * on failure. The handle must remain live and cannot be accessed or freed concurrently. */
+int32_t rawdinal_raw_v1_copy_tag_numbers(const rawdinal_raw_v1_image *image, size_t directory,
+                                       size_t index, double *output, size_t count);
 
 #ifdef __cplusplus
 }
