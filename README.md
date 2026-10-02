@@ -1,6 +1,6 @@
 # Rawdinal
 
-Rawdinal is an experimental Rust library for decoding selected Sigma X3F files and Apple ProRAW DNG files. It provides a safe Rust API and a C-compatible static library, with no third-party Rust dependencies.
+Rawdinal is an experimental Rust library for decoding selected Sigma X3F files and Apple ProRAW DNG files. It provides a safe Rust API and a C-compatible static library. JPEG XL and lossy JPEG decoding use pinned Rust codec crates; X3F and lossless JPEG decoding are implemented in this repository.
 
 | Input / API | Output |
 | --- | --- |
@@ -41,15 +41,28 @@ For the original sd Quattro, the experimental renderer offers bilinear or guided
 
 ## Apple ProRAW DNG
 
-The ProRAW decoder accepts the observed Apple DNG 1.6 layout: classic TIFF in either byte order, a tiled three-channel `LinearRaw` image, 12-bit unsigned samples compressed with lossless JPEG (SOF3, compression tag `7`), a 4,096-entry linearization table, and per-channel black and white levels. The supported backward-version declaration is DNG 1.0 through 1.3. Support is layout-based rather than a promise to decode every ProRAW mode or iPhone model.
+The ProRAW decoder accepts Apple three-channel `LinearRaw` images in classic TIFF, in either byte order, with DNG version declarations from 1.0 through 1.7.1. Support is layout-based rather than a promise to decode every ProRAW mode or iPhone model.
 
-Decoding produces a full-size, already-demosaiced image in camera-native channel order. Rawdinal applies the linearization table, subtracts the black level, and normalizes by the black-to-white range. Samples are floating point and are not clamped to `[0, 1]`. The result still requires white balance and color conversion before display.
+| Storage | Implemented sample domain |
+| --- | --- |
+| Uncompressed | Unsigned 8–16-bit samples, including packed rows |
+| Lossless JPEG, compression `7` | SOF3, unsigned 8–16-bit samples |
+| Lossy JPEG, compression `34892` | 8-bit output from the JPEG decoder |
+| JPEG XL, compression `52546` | Integer codestreams up to 16 bits; TIFF storage is 8 bits for codestream precision up to 8, otherwise 16 bits |
 
-`LinearRawImage` and the C `rawdinal_raw_v1_info` descriptor expose dimensions, component order, camera identification, DNG versions, and processing-state flags. Active area, default crop and orientation are reported without transforming the pixels. Baseline exposure, profile tone curves, profile gain tables and semantic masks remain unapplied; the `ProfileGainTableMap` payload is preserved as bytes. The full DNG metadata graph is not retained, so callers should keep the original file for white-balance, calibration and EXIF metadata.
+Tiled and strip storage, chunky and planar channels, and row/column interleave are supported. JPEG XL uses the full 8/16-bit output range of the Adobe SDK/libjxl integer route, rather than assuming codestream precision equals TIFF precision. Codestream orientation is undone during assembly; TIFF orientation remains unapplied. Animation, extra JPEG XL channels, floating-point codestreams, and XYB with an ICC output profile are rejected.
 
-JPEG XL ProRAW, CFA/mosaic DNG, strip-based storage, DNG opcode lists and other unsupported layouts are rejected. `probe` provides bounded container facts in Rust; `rawdinal_raw_v1_probe` classifies input for the ProRAW C decoder without decoding samples. The C capabilities query currently advertises only lossless JPEG. X3F decoding uses the separate sensor or experimental-render APIs.
+Normalization applies an optional linearization table, subtracts the active-area-relative repeated black pattern and horizontal/vertical deltas, then divides by `WhiteLevel - maximum_channel_black`. Missing tables use identity; missing black levels use zero. Missing white levels use the TIFF integer maximum. Normalization preserves negative and above-white values. Mandatory opcode processing can introduce the clipping or quantization prescribed by that operation.
 
-Pre-linearization tile samples from 21 original ProRAW files have matched the independent `imagecodecs.jpegsof3` decoder. Rendered-color comparisons against Apple Core Image or the Adobe DNG SDK, and validation with 48 MP/JPEG XL originals, remain open.
+Opcode lists execute before linearization, after normalization in active-image coordinates, and at the final LinearRaw stage. Implemented operations are TrimBounds, MapTable, MapPolynomial, GainMap, DeltaPerRow/Column and ScalePerRow/Column (IDs 6–13). Unsupported optional operations are skipped and reported; unsupported mandatory operations fail. Stage 1 uses logical uint16 code units, including for 8-bit inputs; subsequent stages use normalized float values with no retained black pedestal. Nondefault sub-tile blocks, CFA/mosaic DNG, BigTIFF and unsupported predictors remain outside this decoder.
+
+`Dng::decode_with_options` returns `DngDecodedImage`, containing the existing `LinearRawImage` descriptor plus scoped, owned TIFF/EXIF/GPS fields. Calibration matrices, white balance, custom illuminants, noise metadata, profile curves and opaque private fields remain accessible through their original IFDs and tag numbers. `metadata.calibration()` provides numeric access to the main white-balance and three-illuminant matrix fields. Private embedded offsets and external/extra profile references can still require the original file.
+
+The extended result reports fractional crop values and `valid_area`. Pixels outside that region have unspecified processing contents and must be excluded from downstream processing. The legacy Rust `Dng::decode` keeps its original return type and rejects fractional crop or opcode trimming that its descriptor cannot express. In C, the original descriptor layout is unchanged; use the new metadata getters for exact geometry and valid bounds.
+
+Optional decode flags retain assembled pre-opcode codes, sample-domain clipping evidence, and decoded semantic masks. These flags do not measure photosite saturation. Masks are separate 8-bit weight images with their own dimensions, names and canvas mapping. `Dng::jpeg_preview` borrows an embedded JPEG preview. `ProfileGainTable::parse` interprets gain-table versions 1 and 2; its explicit evaluator requires already-converted linear RIMM/ProPhoto RGB. White balance, color conversion, baseline exposure and the preferred Apple appearance remain host responsibilities.
+
+All 21 available originals decode. An original's 36,578,304 assembled samples also match the independent TIFF/SOF3 reference and the separate normalization formula reference, with zero float32 ULP difference. Synthetic tests cover JPEG XL, lossy JPEG, reduced precision and a 48 MP full-image decode. Apple Core Image/Adobe SDK color-reference comparisons and qualification with actual 48 MP/JPEG XL originals remain open.
 
 ## Build and test
 
@@ -71,6 +84,7 @@ The `rawdinal` package provides the Rust library and the X3F-only `rawdinal-insp
 Install a C compiler, CMake and Make or Ninja, then run:
 
 ```sh
+cargo fetch --locked
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --parallel
 ctest --test-dir build --output-on-failure
@@ -104,7 +118,7 @@ nmake /f Makefile.windows clean
 
 ### CMake integration and installation
 
-Both makefiles build the release static library and C ABI test executables. Their `test` target also runs the Rust workspace tests. CMake invokes Cargo with `--release --offline --locked`; the workspace has no external Rust crates to fetch. Build output lives under the chosen build directory, with Cargo artifacts in its `cargo/` subdirectory.
+Both makefiles build the release static library and C ABI test executables. Their `test` target also runs the Rust workspace tests. CMake invokes Cargo with `--release --offline --locked`; run `cargo fetch --locked` once while online to populate the dependency cache before using CMake or the makefiles. Build output lives under the chosen build directory, with Cargo artifacts in its `cargo/` subdirectory. No system libjxl or libjpeg installation is required.
 
 The CMake build exposes the `rawdinal` target, including platform-specific system link libraries, when included with `add_subdirectory`:
 
@@ -165,9 +179,16 @@ python3 tests/proraw_reference.py INPUT.dng NEW_REFERENCE_DIRECTORY
 PRORAW_SAMPLE=INPUT.dng PRORAW_REFERENCE_DIR=NEW_REFERENCE_DIRECTORY \
   cargo test --locked -p rawdinal \
   lossless_jpeg::tests::proraw_tiles_match_independent_samples_before_linearization -- --ignored --exact
+PRORAW_SAMPLE=INPUT.dng PRORAW_REFERENCE_DIR=NEW_REFERENCE_DIRECTORY \
+  cargo test --release --locked -p rawdinal --test proraw \
+  assembled_normalized_image_matches_formula_reference -- --ignored --exact --nocapture
+cargo test --release --locked -p rawdinal --test proraw_extended \
+  decodes_synthetic_48_megapixel_single_strip -- --ignored --exact
 ```
 
-This checks decoded integer tile samples before linearization, not a finished photographic rendering. Python and its reference dependencies are not needed to build or use Rawdinal. The environment-variable examples above use POSIX shell syntax; in a Windows Command Prompt, set each variable with `set "NAME=value"` before running Cargo.
+Schema-2 references record and verify source, tile, manifest and full-stage SHA-256 hashes, dependency versions, selected IFD and geometry. TIFF parsing and SOF3 decoding use separate libraries; assembly and normalization use an independently written formula implementation, not an independent complete DNG engine. The generator currently accepts chunky tiled SOF3 inputs without opcodes. Neither comparison validates camera-to-working-space conversion or the Apple look. The 48 MP test allocates a large synthetic image and is separate from real-device qualification.
+
+Python and its reference dependencies are not needed to build or use Rawdinal. The environment-variable examples above use POSIX shell syntax; in a Windows Command Prompt, set each variable with `set "NAME=value"` before running Cargo.
 
 ### X3F reconstruction diagnostics
 
@@ -188,7 +209,7 @@ The diagnostic uses the renderer's half-pixel alignment and an assumed 2×2 aver
 
 - `rawdinal_preview` returns JPEG storage borrowed from the X3F input buffer.
 - `rawdinal_sensor_v1_decode` owns the X3F physical planes, copied EXIF and decompressed CAMF. Getters borrow those buffers until `rawdinal_sensor_v1_free`.
-- `rawdinal_raw_v1_decode` owns ProRAW samples and the retained metadata. Pointers returned by `rawdinal_raw_v1_get_info` remain valid until `rawdinal_raw_v1_free`; input bytes are borrowed only during decoding.
+- `rawdinal_raw_v1_decode` owns ProRAW samples and scoped metadata. `rawdinal_raw_v1_decode_extended` adds optional codes, diagnostic flags and masks. The info, metadata, directory, tag and mask getters borrow handle-owned storage until `rawdinal_raw_v1_free`; input bytes are borrowed only during decoding.
 - `rawdinal_decode` returns an experimental X3F image handle whose EXIF pointer remains valid until `rawdinal_free`. `rawdinal_copy_rgba` copies unbounded linear-sRGB RGBA into caller-owned storage. `rawdinal_decode_with_clipping_v1` also retains the masks borrowed through `rawdinal_get_clipping_v1` until `rawdinal_free`.
 
 Use the matching free function for each handle. See the header for pointer validity, non-overlap and concurrency requirements.

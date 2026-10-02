@@ -1,3 +1,4 @@
+use crate::dng_metadata::{DirectoryRange, TagRange, number};
 use std::fmt;
 
 const TIFF_MAGIC: u16 = 42;
@@ -57,6 +58,8 @@ pub struct DecodeLimits {
     pub max_pixels: u64,
     pub max_frame_samples: u64,
     pub max_decoded_samples: u64,
+    pub max_metadata_bytes: usize,
+    pub max_codec_bytes: usize,
 }
 
 impl Default for DecodeLimits {
@@ -65,18 +68,28 @@ impl Default for DecodeLimits {
             max_input_bytes: 512 * 1024 * 1024,
             max_ifds: 64,
             max_ifd_entries: 4_096,
-            max_value_bytes: 16 * 1024,
+            max_value_bytes: 256 * 1024,
             max_profile_gain_table_bytes: 16 * 1024 * 1024,
             max_width: 65_536,
             max_height: 65_536,
             max_pixels: 50 * 1024 * 1024,
-            max_frame_samples: 4 * 1024 * 1024,
+            max_frame_samples: 160 * 1024 * 1024,
             max_decoded_samples: 160 * 1024 * 1024,
+            max_metadata_bytes: 64 * 1024 * 1024,
+            max_codec_bytes: 1024 * 1024 * 1024,
         }
     }
 }
 
 impl DecodeLimits {
+    pub fn with_max_metadata_bytes(mut self, value: usize) -> Self {
+        self.max_metadata_bytes = value;
+        self
+    }
+    pub fn with_max_codec_bytes(mut self, value: usize) -> Self {
+        self.max_codec_bytes = value;
+        self
+    }
     pub fn with_max_input_bytes(mut self, value: usize) -> Self {
         self.max_input_bytes = value;
         self
@@ -289,6 +302,7 @@ pub(crate) fn dng_raw_facts(bytes: &[u8], limits: DecodeLimits) -> ProbeResult<D
         _ => return Err(DecodeError::UnsupportedFormat),
     }
     let mut parser = Parser::new(reader, limits);
+    parser.retain_metadata = true;
     parser.parse(reader.offset(4)?)?;
     if parser.dng_version.ok_or(DecodeError::InvalidContainer)? == [0; 4] {
         return Err(DecodeError::InvalidContainer);
@@ -298,7 +312,7 @@ pub(crate) fn dng_raw_facts(bytes: &[u8], limits: DecodeLimits) -> ProbeResult<D
     if candidates.next().is_some() {
         return Err(DecodeError::InvalidGeometry);
     }
-    candidate.into_raw_facts(
+    let mut facts = candidate.into_raw_facts(
         order,
         DngMetadata {
             version: parser.dng_version.ok_or(DecodeError::InvalidContainer)?,
@@ -312,7 +326,10 @@ pub(crate) fn dng_raw_facts(bytes: &[u8], limits: DecodeLimits) -> ProbeResult<D
             has_profile_tone_curve: parser.has_profile_tone_curve,
         },
         limits,
-    )
+    )?;
+    facts.root_offset = reader.u32(4)?;
+    facts.directories = parser.directories;
+    Ok(facts)
 }
 
 impl ByteOrder {
@@ -372,6 +389,9 @@ struct Parser<'a> {
     has_semantic_masks: bool,
     has_baseline_exposure: bool,
     has_profile_tone_curve: bool,
+    directories: Vec<DirectoryRange>,
+    metadata_bytes: usize,
+    retain_metadata: bool,
 }
 
 impl<'a> Parser<'a> {
@@ -390,37 +410,42 @@ impl<'a> Parser<'a> {
             has_semantic_masks: false,
             has_baseline_exposure: false,
             has_profile_tone_curve: false,
+            directories: Vec::new(),
+            metadata_bytes: 0,
+            retain_metadata: false,
         }
     }
 
     fn parse(&mut self, first_ifd: usize) -> ProbeResult<()> {
         let mut work = Vec::new();
-        self.push_work(&mut work, first_ifd, true)?;
-        while let Some((offset, is_ifd0)) = work.pop() {
-            self.visit(&mut work, offset, is_ifd0)?;
+        self.push_work(&mut work, first_ifd, true, None)?;
+        while let Some((offset, is_ifd0, parent)) = work.pop() {
+            self.visit(&mut work, offset, is_ifd0, parent)?;
         }
         Ok(())
     }
 
     fn push_work(
         &self,
-        work: &mut Vec<(usize, bool)>,
+        work: &mut Vec<(usize, bool, Option<u32>)>,
         offset: usize,
         is_ifd0: bool,
+        parent: Option<u32>,
     ) -> ProbeResult<()> {
         if work.len() >= self.limits.max_ifds {
             return Err(DecodeError::ResourceLimit);
         }
         work.try_reserve(1).map_err(|_| DecodeError::Allocation)?;
-        work.push((offset, is_ifd0));
+        work.push((offset, is_ifd0, parent));
         Ok(())
     }
 
     fn visit(
         &mut self,
-        work: &mut Vec<(usize, bool)>,
+        work: &mut Vec<(usize, bool, Option<u32>)>,
         offset: usize,
         is_ifd0: bool,
+        parent: Option<u32>,
     ) -> ProbeResult<()> {
         if self.visited.len() >= self.limits.max_ifds {
             return Err(DecodeError::ResourceLimit);
@@ -443,7 +468,15 @@ impl<'a> Parser<'a> {
             .checked_add(size)
             .ok_or(DecodeError::InvalidOffset)?;
         let next_ifd = self.reader.offset(next)?;
-        let mut facts = IfdFacts::default();
+        let mut facts = IfdFacts {
+            offset: offset as u32,
+            ..IfdFacts::default()
+        };
+        let mut directory = DirectoryRange {
+            offset: offset as u32,
+            parent_offset: parent,
+            tags: Vec::new(),
+        };
         let mut sub_ifds = None;
         let mut seen = TagPresence::default();
         for index in 0..count {
@@ -460,6 +493,7 @@ impl<'a> Parser<'a> {
             let kind = self.reader.u16(entry + 2)?;
             let count = self.reader.u32(entry + 4)?;
             let value = entry + 8;
+            self.retain_metadata_tag(&mut directory, entry)?;
             match tag {
                 TAG_DNG_VERSION if is_ifd0 => {
                     self.dng_version = Some(self.version(value, kind, count)?)
@@ -480,7 +514,12 @@ impl<'a> Parser<'a> {
                 TAG_ORIENTATION if is_ifd0 => {
                     self.ifd0_orientation = self.scalar(value, kind, count)?
                 }
-                TAG_STRIP_OFFSETS => facts.has_strip_offsets = true,
+                TAG_STRIP_OFFSETS => {
+                    facts.has_strip_offsets = true;
+                    facts.strip_offsets = Some(self.offsets(value, kind, count)?);
+                }
+                278 => facts.rows_per_strip = self.scalar(value, kind, count)?,
+                279 => facts.strip_byte_counts = Some(self.offsets(value, kind, count)?),
                 TAG_SAMPLES_PER_PIXEL => {
                     facts.samples_per_pixel = self.scalar(value, kind, count)?
                 }
@@ -500,21 +539,31 @@ impl<'a> Parser<'a> {
                     facts.linearization_table = Some(self.sample_components(value, kind, count)?)
                 }
                 TAG_BLACK_LEVEL => {
-                    facts.black_level = Some(self.sample_components(value, kind, count)?)
+                    facts.black_level =
+                        Some(self.real_components(value, kind, count, &[3, 4, 5])?)
                 }
                 TAG_BLACK_LEVEL_REPEAT_DIM => {
                     facts.black_level_repeat_dim = Some(self.pair(value, kind, count)?)
                 }
-                TAG_BLACK_LEVEL_DELTA_H => facts.has_black_level_delta_h = true,
-                TAG_BLACK_LEVEL_DELTA_V => facts.has_black_level_delta_v = true,
+                TAG_BLACK_LEVEL_DELTA_H => {
+                    facts.black_level_delta_h =
+                        Some(self.real_components(value, kind, count, &[10])?)
+                }
+                TAG_BLACK_LEVEL_DELTA_V => {
+                    facts.black_level_delta_v =
+                        Some(self.real_components(value, kind, count, &[10])?)
+                }
                 TAG_WHITE_LEVEL => {
-                    facts.white_level = Some(self.sample_components(value, kind, count)?)
+                    facts.white_level = Some(self.real_components(value, kind, count, &[3, 4])?)
                 }
                 TAG_DEFAULT_CROP_ORIGIN => {
-                    facts.default_crop_origin = Some(self.pair(value, kind, count)?)
+                    facts.default_crop_origin_exact = Some(self.real_pair(value, kind, count)?);
+                    facts.default_crop_origin =
+                        integral_pair(facts.default_crop_origin_exact.unwrap());
                 }
                 TAG_DEFAULT_CROP_SIZE => {
-                    facts.default_crop_size = Some(self.pair(value, kind, count)?)
+                    facts.default_crop_size_exact = Some(self.real_pair(value, kind, count)?);
+                    facts.default_crop_size = integral_pair(facts.default_crop_size_exact.unwrap());
                 }
                 TAG_ACTIVE_AREA => facts.active_area = Some(self.quad(value, kind, count)?),
                 TAG_COLORIMETRIC_REFERENCE if is_ifd0 => {
@@ -531,6 +580,10 @@ impl<'a> Parser<'a> {
                     facts.row_interleave_factor =
                         Some(self.short_or_long_scalar(value, kind, count)?)
                 }
+                52547 => {
+                    facts.column_interleave_factor =
+                        Some(self.short_or_long_scalar(value, kind, count)?)
+                }
                 TAG_BASELINE_EXPOSURE => {
                     self.baseline_exposure(value, kind, count)?;
                     if is_ifd0 {
@@ -541,9 +594,18 @@ impl<'a> Parser<'a> {
                     facts.profile_gain_table_map =
                         Some(self.profile_gain_table_range(value, kind, count)?)
                 }
-                TAG_OPCODE_LIST_1 => facts.has_opcode_list_1 = true,
-                TAG_OPCODE_LIST_2 => facts.has_opcode_list_2 = true,
-                TAG_OPCODE_LIST_3 => facts.has_opcode_list_3 = true,
+                52544 => {
+                    self.profile_gain_table_range(value, kind, count)?;
+                }
+                TAG_OPCODE_LIST_1 => {
+                    facts.opcode_lists[0] = Some(self.profile_gain_table_range(value, kind, count)?)
+                }
+                TAG_OPCODE_LIST_2 => {
+                    facts.opcode_lists[1] = Some(self.profile_gain_table_range(value, kind, count)?)
+                }
+                TAG_OPCODE_LIST_3 => {
+                    facts.opcode_lists[2] = Some(self.profile_gain_table_range(value, kind, count)?)
+                }
                 TAG_PROFILE_TONE_CURVE => {
                     self.profile_tone_curve(value, kind, count)?;
                     if is_ifd0 {
@@ -552,12 +614,22 @@ impl<'a> Parser<'a> {
                 }
                 TAG_ORIENTATION => facts.orientation = self.scalar(value, kind, count)?,
                 TAG_SUB_IFDS => sub_ifds = Some((value, kind, count)),
+                34665 | 34853 | 40965 => {
+                    let child = self.short_or_long_scalar(value, kind, count)?;
+                    if child != 0 {
+                        self.push_work(work, child as usize, false, Some(offset as u32))?;
+                    }
+                }
                 TAG_SAMPLE_FORMAT => {
                     facts.sample_format = Some(self.components(value, kind, count)?)
                 }
                 _ => {}
             }
         }
+        self.directories
+            .try_reserve(1)
+            .map_err(|_| DecodeError::Allocation)?;
+        self.directories.push(directory);
         if facts.new_subfile_type == Some(65_540) {
             self.has_semantic_masks = true;
         }
@@ -569,12 +641,58 @@ impl<'a> Parser<'a> {
         }
         if let Some((value, kind, count)) = sub_ifds {
             for index in 0..count {
-                self.push_work(work, self.sub_ifd_offset(value, kind, count, index)?, false)?;
+                self.push_work(
+                    work,
+                    self.sub_ifd_offset(value, kind, count, index)?,
+                    false,
+                    Some(offset as u32),
+                )?;
             }
         }
         if next_ifd != 0 {
-            self.push_work(work, next_ifd, false)?;
+            self.push_work(work, next_ifd, false, parent)?;
         }
+        Ok(())
+    }
+
+    fn retain_metadata_tag(
+        &mut self,
+        directory: &mut DirectoryRange,
+        entry: usize,
+    ) -> ProbeResult<()> {
+        if !self.retain_metadata {
+            return Ok(());
+        }
+        let id = self.reader.u16(entry)?;
+        let field_type = self.reader.u16(entry + 2)?;
+        let count = self.reader.u32(entry + 4)?;
+        let value = entry + 8;
+        let size = type_size(field_type)?
+            .checked_mul(count as usize)
+            .ok_or(DecodeError::ResourceLimit)?;
+        self.metadata_bytes = self
+            .metadata_bytes
+            .checked_add(size)
+            .ok_or(DecodeError::ResourceLimit)?;
+        if self.metadata_bytes > self.limits.max_metadata_bytes {
+            return Err(DecodeError::ResourceLimit);
+        }
+        let start = if size <= 4 {
+            value
+        } else {
+            self.reader.offset(value)?
+        };
+        self.reader.bytes(start, size)?;
+        directory
+            .tags
+            .try_reserve(1)
+            .map_err(|_| DecodeError::Allocation)?;
+        directory.tags.push(TagRange {
+            id,
+            field_type,
+            count,
+            range: start..start + size,
+        });
         Ok(())
     }
 
@@ -690,6 +808,32 @@ impl<'a> Parser<'a> {
         }
     }
 
+    fn real_components(
+        &self,
+        value: usize,
+        kind: u16,
+        count: u32,
+        kinds: &[u16],
+    ) -> ProbeResult<Vec<f64>> {
+        if !kinds.contains(&kind) || count == 0 {
+            return Err(DecodeError::InvalidTag);
+        }
+        let bytes = self.value(value, kind, count)?;
+        let mut values = crate::dng_metadata::allocate(count as usize)?;
+        for index in 0..count as usize {
+            values.push(number(bytes, kind, index, self.reader.order)?);
+        }
+        Ok(values)
+    }
+
+    fn real_pair(&self, value: usize, kind: u16, count: u32) -> ProbeResult<[f64; 2]> {
+        if count != 2 {
+            return Err(DecodeError::InvalidTag);
+        }
+        let values = self.real_components(value, kind, count, &[3, 4, 5])?;
+        Ok([values[0], values[1]])
+    }
+
     fn profile_gain_table_range(
         &self,
         value: usize,
@@ -755,8 +899,8 @@ impl<'a> Parser<'a> {
                 let numerator = self.u32(bytes, offset)?;
                 let denominator =
                     self.u32(bytes, offset.checked_add(4).ok_or(DecodeError::InvalidTag)?)?;
-                if denominator == 1 {
-                    Ok(numerator)
+                if denominator != 0 && numerator % denominator == 0 {
+                    Ok(numerator / denominator)
                 } else {
                     Err(DecodeError::UnsupportedFeature)
                 }
@@ -808,7 +952,7 @@ impl<'a> Parser<'a> {
         usize::try_from(self.u32(bytes, offset)?).map_err(|_| DecodeError::InvalidOffset)
     }
     fn offsets(&self, value: usize, kind: u16, count: u32) -> ProbeResult<Vec<u32>> {
-        if kind != 4 {
+        if !matches!(kind, 3 | 4) {
             return Err(DecodeError::InvalidTag);
         }
         let bytes = self.value(value, kind, count)?;
@@ -818,7 +962,11 @@ impl<'a> Parser<'a> {
             .try_reserve_exact(count)
             .map_err(|_| DecodeError::Allocation)?;
         for index in 0..count {
-            values.push(self.u32(bytes, index.checked_mul(4).ok_or(DecodeError::InvalidTag)?)?);
+            values.push(if kind == 3 {
+                u32::from(self.u16(bytes, index.checked_mul(2).ok_or(DecodeError::InvalidTag)?)?)
+            } else {
+                self.u32(bytes, index.checked_mul(4).ok_or(DecodeError::InvalidTag)?)?
+            });
         }
         Ok(values)
     }
@@ -854,6 +1002,7 @@ fn read_u32_le(bytes: &[u8], offset: usize) -> ProbeResult<u32> {
 
 #[derive(Default, Clone)]
 struct IfdFacts {
+    offset: u32,
     new_subfile_type: Option<u32>,
     width: Option<u32>,
     height: Option<u32>,
@@ -864,27 +1013,31 @@ struct IfdFacts {
     sample_format: Option<Vec<u16>>,
     planar_configuration: Option<u32>,
     has_strip_offsets: bool,
+    strip_offsets: Option<Vec<u32>>,
+    strip_byte_counts: Option<Vec<u32>>,
+    rows_per_strip: Option<u32>,
     has_tile_offsets: bool,
     tile_width: Option<u32>,
     tile_length: Option<u32>,
     tile_offsets: Option<Vec<u32>>,
     tile_byte_counts: Option<Vec<u32>>,
     linearization_table: Option<Vec<u16>>,
-    black_level: Option<Vec<u16>>,
+    black_level: Option<Vec<f64>>,
     black_level_repeat_dim: Option<[u32; 2]>,
-    has_black_level_delta_h: bool,
-    has_black_level_delta_v: bool,
-    white_level: Option<Vec<u16>>,
+    black_level_delta_h: Option<Vec<f64>>,
+    black_level_delta_v: Option<Vec<f64>>,
+    white_level: Option<Vec<f64>>,
     active_area: Option<[u32; 4]>,
     orientation: Option<u32>,
     default_crop_origin: Option<[u32; 2]>,
     default_crop_size: Option<[u32; 2]>,
-    has_opcode_list_1: bool,
-    has_opcode_list_2: bool,
-    has_opcode_list_3: bool,
+    default_crop_origin_exact: Option<[f64; 2]>,
+    default_crop_size_exact: Option<[f64; 2]>,
+    opcode_lists: [Option<std::ops::Range<usize>>; 3],
     profile_gain_table_map: Option<std::ops::Range<usize>>,
     sub_tile_block_size: Option<[u32; 2]>,
     row_interleave_factor: Option<u32>,
+    column_interleave_factor: Option<u32>,
 }
 
 struct TagPresence([u64; 1024]);
@@ -922,6 +1075,9 @@ struct DngMetadata {
 
 #[derive(Debug)]
 pub(crate) struct DngRawFacts {
+    pub root_offset: u32,
+    pub raw_offset: u32,
+    pub directories: Vec<DirectoryRange>,
     pub dng_version: [u8; 4],
     pub byte_order: ByteOrder,
     pub dng_backward_version: Option<[u8; 4]>,
@@ -936,26 +1092,30 @@ pub(crate) struct DngRawFacts {
     pub sample_format: Vec<u16>,
     pub planar_configuration: u16,
     pub has_strip_offsets: bool,
+    pub strip_offsets: Option<Vec<u32>>,
+    pub strip_byte_counts: Option<Vec<u32>>,
+    pub rows_per_strip: Option<u32>,
     pub tile_width: Option<u32>,
     pub tile_length: Option<u32>,
     pub tile_offsets: Option<Vec<u32>>,
     pub tile_byte_counts: Option<Vec<u32>>,
     pub linearization_table: Option<Vec<u16>>,
-    pub black_level: Option<Vec<u16>>,
+    pub black_level: Option<Vec<f64>>,
     pub black_level_repeat_dim: Option<[u32; 2]>,
-    pub has_black_level_delta_h: bool,
-    pub has_black_level_delta_v: bool,
-    pub white_level: Option<Vec<u16>>,
+    pub black_level_delta_h: Option<Vec<f64>>,
+    pub black_level_delta_v: Option<Vec<f64>>,
+    pub white_level: Option<Vec<f64>>,
     pub colorimetric_reference: Option<u32>,
     pub sub_tile_block_size: Option<[u32; 2]>,
     pub row_interleave_factor: Option<u32>,
+    pub column_interleave_factor: Option<u32>,
     pub active_area: Option<[u32; 4]>,
     pub orientation: Option<u32>,
     pub default_crop_origin: Option<[u32; 2]>,
     pub default_crop_size: Option<[u32; 2]>,
-    pub has_opcode_list_1: bool,
-    pub has_opcode_list_2: bool,
-    pub has_opcode_list_3: bool,
+    pub default_crop_origin_exact: Option<[f64; 2]>,
+    pub default_crop_size_exact: Option<[f64; 2]>,
+    pub opcode_lists: [Option<std::ops::Range<usize>>; 3],
     pub profile_gain_table_map: Option<std::ops::Range<usize>>,
     pub has_semantic_masks: bool,
     pub has_baseline_exposure: bool,
@@ -1050,6 +1210,9 @@ impl IfdFacts {
             limits,
         )?;
         Ok(DngRawFacts {
+            root_offset: 0,
+            raw_offset: self.offset,
+            directories: Vec::new(),
             dng_version: metadata.version,
             byte_order,
             dng_backward_version: metadata.backward_version,
@@ -1064,6 +1227,9 @@ impl IfdFacts {
             sample_format: facts.sample_format,
             planar_configuration: facts.planar_configuration,
             has_strip_offsets: facts.has_strip_offsets,
+            strip_offsets: self.strip_offsets,
+            strip_byte_counts: self.strip_byte_counts,
+            rows_per_strip: self.rows_per_strip,
             tile_width: self.tile_width,
             tile_length: self.tile_length,
             tile_offsets: self.tile_offsets,
@@ -1071,19 +1237,20 @@ impl IfdFacts {
             linearization_table: self.linearization_table,
             black_level: self.black_level,
             black_level_repeat_dim: self.black_level_repeat_dim,
-            has_black_level_delta_h: self.has_black_level_delta_h,
-            has_black_level_delta_v: self.has_black_level_delta_v,
+            black_level_delta_h: self.black_level_delta_h,
+            black_level_delta_v: self.black_level_delta_v,
             white_level: self.white_level,
             colorimetric_reference: metadata.colorimetric_reference,
             sub_tile_block_size: self.sub_tile_block_size,
             row_interleave_factor: self.row_interleave_factor,
+            column_interleave_factor: self.column_interleave_factor,
             active_area: self.active_area,
             orientation: metadata.orientation.or(self.orientation),
             default_crop_origin: self.default_crop_origin,
             default_crop_size: self.default_crop_size,
-            has_opcode_list_1: self.has_opcode_list_1,
-            has_opcode_list_2: self.has_opcode_list_2,
-            has_opcode_list_3: self.has_opcode_list_3,
+            default_crop_origin_exact: self.default_crop_origin_exact,
+            default_crop_size_exact: self.default_crop_size_exact,
+            opcode_lists: self.opcode_lists,
             profile_gain_table_map: self.profile_gain_table_map,
             has_semantic_masks: metadata.has_semantic_masks,
             has_baseline_exposure: metadata.has_baseline_exposure,
@@ -1099,6 +1266,13 @@ fn default_components(count: usize) -> ProbeResult<Vec<u16>> {
         .map_err(|_| DecodeError::Allocation)?;
     values.resize(count, 1);
     Ok(values)
+}
+
+fn integral_pair(values: [f64; 2]) -> Option<[u32; 2]> {
+    values
+        .iter()
+        .all(|value| *value >= 0.0 && *value <= f64::from(u32::MAX) && value.fract() == 0.0)
+        .then_some([values[0] as u32, values[1] as u32])
 }
 
 #[cfg(test)]
@@ -1608,7 +1782,7 @@ mod tests {
     fn defaults_bound_common_proraw_output() {
         let limits = DecodeLimits::default();
         assert_eq!(limits.max_pixels, 50 * 1024 * 1024);
-        assert_eq!(limits.max_frame_samples, 4 * 1024 * 1024);
+        assert_eq!(limits.max_frame_samples, 160 * 1024 * 1024);
         assert_eq!(limits.max_decoded_samples, 160 * 1024 * 1024);
         assert!(48_000_000_u64 <= limits.max_pixels);
         assert!(144_000_000_u64 <= limits.max_decoded_samples);

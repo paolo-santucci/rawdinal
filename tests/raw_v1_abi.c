@@ -85,7 +85,21 @@ int main(void)
   CHECK(probe.version == 0 && error[sizeof(error) - 1] == '\0');
   CHECK(rawdinal_raw_v1_get_capabilities(&capabilities) == RAWDINAL_STATUS_OK);
   CHECK(capabilities.version == RAWDINAL_RAW_V1_CAPABILITIES_VERSION);
-  CHECK(capabilities.codec_bits == RAWDINAL_RAW_V1_CODEC_BIT_LOSSLESS_JPEG);
+  CHECK(capabilities.codec_bits == (RAWDINAL_RAW_V1_CODEC_BIT_LOSSLESS_JPEG | RAWDINAL_RAW_V1_CODEC_BIT_JPEG_XL
+                                     | RAWDINAL_RAW_V1_CODEC_BIT_UNCOMPRESSED | RAWDINAL_RAW_V1_CODEC_BIT_LOSSY_JPEG));
+  {
+    rawdinal_raw_v1_metadata metadata = {0};
+    rawdinal_raw_v1_directory directory = {0};
+    rawdinal_raw_v1_tag tag = {0};
+    rawdinal_raw_v1_mask mask = {0};
+    double number = 9.0;
+    CHECK(rawdinal_raw_v1_get_metadata(NULL, &metadata) == RAWDINAL_STATUS_INVALID_INPUT);
+    CHECK(rawdinal_raw_v1_get_directory(NULL, 0, &directory) == RAWDINAL_STATUS_INVALID_INPUT);
+    CHECK(rawdinal_raw_v1_get_tag(NULL, 0, 0, &tag) == RAWDINAL_STATUS_INVALID_INPUT);
+    CHECK(rawdinal_raw_v1_get_mask(NULL, 0, &mask) == RAWDINAL_STATUS_INVALID_INPUT);
+    CHECK(rawdinal_raw_v1_copy_tag_numbers(NULL, 0, 0, &number, 1) == RAWDINAL_STATUS_INVALID_INPUT);
+    CHECK(metadata.version == 0 && tag.data == NULL && mask.samples == NULL && number == 9.0);
+  }
   rawdinal_raw_v1_free(NULL);
 
   if (path != NULL) {
@@ -104,7 +118,9 @@ int main(void)
     CHECK(rawdinal_raw_v1_probe(input, (size_t)length, &probe, error, sizeof(error)) == RAWDINAL_STATUS_OK);
     CHECK(probe.classification == RAWDINAL_RAW_V1_PROBE_SUPPORTED && probe.container == RAWDINAL_RAW_V1_CONTAINER_DNG);
     CHECK(probe.codec == RAWDINAL_RAW_V1_CODEC_LOSSLESS_JPEG && probe.width == 4032 && probe.height == 3024 && probe.channels == 3);
-    CHECK(rawdinal_raw_v1_decode(input, (size_t)length, &image, error, sizeof(error)) == RAWDINAL_STATUS_OK);
+    CHECK(rawdinal_raw_v1_decode_extended(input, (size_t)length,
+          RAWDINAL_RAW_V1_RETAIN_ENCODED | RAWDINAL_RAW_V1_RETAIN_FLAGS | RAWDINAL_RAW_V1_DECODE_MASKS,
+          &image, error, sizeof(error)) == RAWDINAL_STATUS_OK);
     free(input);
     CHECK(rawdinal_raw_v1_get_info(image, &info) == RAWDINAL_STATUS_OK);
     CHECK(info.version == RAWDINAL_RAW_V1_INFO_VERSION);
@@ -133,6 +149,33 @@ int main(void)
     CHECK(info.already_demosaiced == RAWDINAL_RAW_V1_TRUE);
     value = checksum(info.samples, info.sample_count);
     CHECK(value == UINT64_C(0xdefdc0442475559c));
+    {
+      rawdinal_raw_v1_metadata metadata = {0};
+      size_t index;
+      size_t fields = 0;
+      CHECK(rawdinal_raw_v1_get_metadata(image, &metadata) == RAWDINAL_STATUS_OK);
+      CHECK(metadata.version == 1 && metadata.directory_count > 0);
+      CHECK(metadata.encoded_sample_count == info.sample_count && metadata.encoded_samples != NULL);
+      CHECK(metadata.sample_flag_count == info.sample_count && metadata.sample_flags != NULL);
+      for(index = 0; index < metadata.directory_count; ++index) {
+        rawdinal_raw_v1_directory directory = {0};
+        size_t field;
+        CHECK(rawdinal_raw_v1_get_directory(image, index, &directory) == RAWDINAL_STATUS_OK);
+        for(field = 0; field < directory.tag_count; ++field) {
+          rawdinal_raw_v1_tag tag = {0};
+          CHECK(rawdinal_raw_v1_get_tag(image, index, field, &tag) == RAWDINAL_STATUS_OK);
+          CHECK(tag.count == 0 || tag.data != NULL);
+          ++fields;
+        }
+      }
+      CHECK(fields > 0 && metadata.mask_count > 0);
+      for(index = 0; index < metadata.mask_count; ++index) {
+        rawdinal_raw_v1_mask mask = {0};
+        CHECK(rawdinal_raw_v1_get_mask(image, index, &mask) == RAWDINAL_STATUS_OK);
+        CHECK(mask.width > 0 && mask.height > 0 && mask.samples != NULL);
+        CHECK(mask.sample_count == (size_t)mask.width * mask.height);
+      }
+    }
     rawdinal_raw_v1_free(image);
   }
   return 0;

@@ -488,6 +488,10 @@ impl<'a> Parser<'a> {
 }
 
 #[cfg(test)]
+#[path = "../tests/support/proraw_reference.rs"]
+mod reference;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -496,6 +500,16 @@ mod tests {
     fn proraw_tiles_match_independent_samples_before_linearization() {
         let source = std::fs::read(std::env::var_os("PRORAW_SAMPLE").unwrap()).unwrap();
         let directory = std::path::PathBuf::from(std::env::var_os("PRORAW_REFERENCE_DIR").unwrap());
+        let provenance = super::reference::verified_manifest(&source, &directory);
+        let facts = crate::probe::dng_raw_facts(&source, crate::DecodeLimits::default()).unwrap();
+        let tiles = provenance["tiles"].as_array().unwrap();
+        let offsets = facts.tile_offsets.unwrap();
+        let counts = facts.tile_byte_counts.unwrap();
+        assert_eq!(tiles.len(), offsets.len());
+        for ((tile, offset), count) in tiles.iter().zip(offsets).zip(counts) {
+            assert_eq!(tile["offset"], offset);
+            assert_eq!(tile["size"], count);
+        }
         let manifest = std::fs::read_to_string(directory.join("tiles.txt")).unwrap();
         assert!(!manifest.trim().is_empty());
         let mut samples = 0;

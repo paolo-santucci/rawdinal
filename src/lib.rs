@@ -6,6 +6,12 @@
 mod camf;
 mod container;
 mod dng;
+mod dng_codec;
+mod dng_mask;
+mod dng_metadata;
+mod dng_normalize;
+mod dng_opcode;
+mod dng_profile;
 mod entropy;
 pub mod experimental;
 mod lossless_jpeg;
@@ -15,7 +21,12 @@ mod reader;
 
 pub use camf::{Calibration, Entry, Matrix};
 pub use container::{Plane, SensorFormat, SensorImage, X3f};
-pub use dng::{Dng, LinearRawImage, LinearRawProcessing, LinearRawProcessingState};
+pub use dng::{
+    Dng, DngDecodeOptions, DngDecodedImage, DngSemanticMask, LinearRawImage, LinearRawProcessing,
+    LinearRawProcessingState,
+};
+pub use dng_metadata::{DngCalibration, DngDirectory, DngMetadata, DngTag};
+pub use dng_profile::ProfileGainTable;
 pub use probe::{
     ByteOrder, ContainerProbe, DecodeError, DecodeLimits, DngFacts, ProbeResult, X3fFacts, probe,
 };

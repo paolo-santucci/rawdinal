@@ -20,6 +20,8 @@ use std::{
     ptr, slice,
 };
 
+mod dng_metadata;
+
 pub struct Image {
     pixels: LinearImage,
     clipping: Option<ClippingProvenance>,
@@ -27,7 +29,6 @@ pub struct Image {
 }
 
 #[repr(C)]
-#[derive(Default)]
 pub struct ClippingV1Plane {
     identity: u32,
     threshold_code: u32,
@@ -41,7 +42,6 @@ pub struct ClippingV1Plane {
 }
 
 #[repr(C)]
-#[derive(Default)]
 pub struct ClippingV1Info {
     version: u32,
     reserved: u32,
@@ -51,6 +51,37 @@ pub struct ClippingV1Info {
     byte_count: usize,
     data: *const u8,
     planes: [ClippingV1Plane; 3],
+}
+
+impl Default for ClippingV1Plane {
+    fn default() -> Self {
+        Self {
+            identity: 0,
+            threshold_code: 0,
+            threshold_provenance: 0,
+            reserved: 0,
+            width: 0,
+            height: 0,
+            stride_bytes: 0,
+            byte_count: 0,
+            data: ptr::null(),
+        }
+    }
+}
+
+impl Default for ClippingV1Info {
+    fn default() -> Self {
+        Self {
+            version: 0,
+            reserved: 0,
+            width: 0,
+            height: 0,
+            stride_bytes: 0,
+            byte_count: 0,
+            data: ptr::null(),
+            planes: Default::default(),
+        }
+    }
 }
 
 #[repr(C)]
@@ -79,7 +110,7 @@ pub struct SensorImage {
 }
 
 pub struct RawV1Image {
-    image: LinearRawImage,
+    image: rawdinal::DngDecodedImage,
 }
 
 #[repr(C)]
@@ -545,12 +576,28 @@ pub unsafe extern "C" fn rawdinal_raw_v1_decode(
     error: *mut c_char,
     error_capacity: usize,
 ) -> i32 {
+    unsafe { rawdinal_raw_v1_decode_extended(data, length, 0, output, error, error_capacity) }
+}
+
+/// Decodes ProRAW with optional encoded samples (bit 0), sample flags (bit 1), and semantic masks (bit 2).
+///
+/// # Safety
+/// The pointer and ownership requirements are identical to [`rawdinal_raw_v1_decode`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rawdinal_raw_v1_decode_extended(
+    data: *const u8,
+    length: usize,
+    flags: u32,
+    output: *mut *mut RawV1Image,
+    error: *mut c_char,
+    error_capacity: usize,
+) -> i32 {
     match catch_unwind(AssertUnwindSafe(|| {
         unsafe {
             clear_raw_output(output);
             write_error(error, error_capacity, "");
         }
-        if output.is_null() || data.is_null() {
+        if output.is_null() || data.is_null() || flags & !7 != 0 {
             unsafe {
                 write_error(error, error_capacity, "invalid raw-v1 arguments");
             }
@@ -563,7 +610,14 @@ pub unsafe extern "C" fn rawdinal_raw_v1_decode(
             return RAW_V1_RESOURCE_LIMIT;
         }
         let bytes = unsafe { slice::from_raw_parts(data, length) };
-        match decode_raw_v1(bytes) {
+        match decode_raw_v1_with_options(
+            bytes,
+            rawdinal::DngDecodeOptions {
+                retain_encoded_samples: flags & 1 != 0,
+                retain_sample_flags: flags & 2 != 0,
+                decode_semantic_masks: flags & 4 != 0,
+            },
+        ) {
             Ok(image) => {
                 unsafe {
                     output.write(Box::into_raw(Box::new(image)));
@@ -593,13 +647,16 @@ fn raw_v1_input_limit_exceeded(length: usize) -> bool {
     length > DecodeLimits::default().max_input_bytes || length > isize::MAX as usize
 }
 
-fn decode_raw_v1(bytes: &[u8]) -> std::result::Result<RawV1Image, DecodeError> {
+fn decode_raw_v1_with_options(
+    bytes: &[u8],
+    options: rawdinal::DngDecodeOptions,
+) -> std::result::Result<RawV1Image, DecodeError> {
     match raw_v1_probe_description(bytes)? {
         RawV1ProbeInfo {
             classification: RAW_V1_PROBE_SUPPORTED,
             ..
         } => Dng::parse(bytes)
-            .and_then(|dng| dng.decode())
+            .and_then(|dng| dng.decode_with_options(options))
             .map(|image| RawV1Image { image }),
         RawV1ProbeInfo {
             classification: RAW_V1_PROBE_NOT_RECOGNIZED,
@@ -684,6 +741,8 @@ fn raw_v1_codec(compression: u16) -> u32 {
     match compression {
         7 => RAW_V1_CODEC_LOSSLESS_JPEG,
         52_546 => RAW_V1_CODEC_JPEG_XL,
+        1 => 3,
+        34892 => 4,
         _ => RAW_V1_CODEC_UNKNOWN,
     }
 }
@@ -752,7 +811,7 @@ pub unsafe extern "C" fn rawdinal_raw_v1_get_capabilities(output: *mut RawV1Capa
             output.write(RawV1Capabilities {
                 version: 1,
                 reserved: 0,
-                codec_bits: RAW_V1_CODEC_BIT_LOSSLESS_JPEG,
+                codec_bits: RAW_V1_CODEC_BIT_LOSSLESS_JPEG | 2 | 4 | 8,
                 reserved2: 0,
             })
         };
@@ -913,6 +972,7 @@ fn raw_v1_processing(value: LinearRawProcessing) -> u32 {
         LinearRawProcessing::Unapplied => 2,
         LinearRawProcessing::Unknown => 3,
         LinearRawProcessing::SkippedOptional => 4,
+        LinearRawProcessing::PartiallyApplied => 5,
         _ => 3,
     }
 }
@@ -1272,26 +1332,44 @@ mod tests {
         }))
     }
 
-    fn raw_v1_handle() -> *mut RawV1Image {
+    pub(super) fn raw_v1_handle() -> *mut RawV1Image {
         Box::into_raw(Box::new(RawV1Image {
-            image: LinearRawImage {
-                width: 2,
-                height: 1,
-                channels: 3,
-                component_ids: vec![1, 2, 3],
-                dng_version: [1, 6, 0, 0],
-                dng_backward_version: Some([1, 3, 0, 0]),
-                tiff_byte_order: Default::default(),
-                make: "Apple".into(),
-                model: Some("iPhone".into()),
-                colorimetric_reference: Some(0),
-                active_area: [0, 0, 1, 2],
-                orientation: Some(1),
-                default_crop_origin: Some([0, 0]),
-                default_crop_size: Some([2, 1]),
-                profile_gain_table_map: Some(vec![4, 5]),
-                samples: vec![0.0, 0.5, 1.0, 1.5, 2.0, 2.5],
-                processing: Default::default(),
+            image: rawdinal::DngDecodedImage {
+                image: LinearRawImage {
+                    width: 2,
+                    height: 1,
+                    channels: 3,
+                    component_ids: vec![1, 2, 3],
+                    dng_version: [1, 6, 0, 0],
+                    dng_backward_version: Some([1, 3, 0, 0]),
+                    tiff_byte_order: Default::default(),
+                    make: "Apple".into(),
+                    model: Some("iPhone".into()),
+                    colorimetric_reference: Some(0),
+                    active_area: [0, 0, 1, 2],
+                    orientation: Some(1),
+                    default_crop_origin: Some([0, 0]),
+                    default_crop_size: Some([2, 1]),
+                    profile_gain_table_map: Some(vec![4, 5]),
+                    samples: vec![0.0, 0.5, 1.0, 1.5, 2.0, 2.5],
+                    processing: Default::default(),
+                },
+                metadata: rawdinal::DngMetadata {
+                    byte_order: Default::default(),
+                    root_offset: 8,
+                    raw_offset: 8,
+                    directories: vec![rawdinal::DngDirectory {
+                        offset: 8,
+                        parent_offset: None,
+                        tags: Vec::new(),
+                    }],
+                },
+                default_crop_origin_exact: Some([0.0, 0.0]),
+                default_crop_size_exact: Some([2.0, 1.0]),
+                valid_area: [0, 0, 1, 2],
+                encoded_samples: None,
+                sample_flags: None,
+                semantic_masks: Vec::new(),
             },
         }))
     }
@@ -1436,7 +1514,9 @@ mod tests {
         assert_eq!(raw_v1_processing(LinearRawProcessing::SkippedOptional), 4);
         assert_eq!(raw_v1_codec(7), 1);
         assert_eq!(raw_v1_codec(52_546), 2);
-        assert_eq!(raw_v1_codec(1), 0);
+        assert_eq!(raw_v1_codec(1), 3);
+        assert_eq!(raw_v1_codec(34892), 4);
+        assert_eq!(raw_v1_codec(999), 0);
     }
 
     #[test]
@@ -1590,7 +1670,8 @@ mod tests {
     fn raw_v1_info_rejects_inconsistent_owned_images() {
         let image = raw_v1_handle();
         unsafe {
-            (*image).image.samples.pop();
+            let decoded = &mut (*image).image;
+            decoded.samples.pop();
         }
         let mut info = RawV1Info {
             version: 99,
@@ -1733,7 +1814,7 @@ mod tests {
                 capabilities.codec_bits,
                 capabilities.reserved2,
             ),
-            (1, 0, 1, 0)
+            (1, 0, 15, 0)
         );
         assert_eq!(
             unsafe { rawdinal_raw_v1_get_capabilities(ptr::null_mut()) },
