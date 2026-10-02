@@ -134,31 +134,7 @@ fn lossy_jpeg(bytes: &[u8], spec: TileSpec, limits: DecodeLimits) -> ProbeResult
 }
 
 fn jpeg_xl(bytes: &[u8], spec: TileSpec, limits: DecodeLimits) -> ProbeResult<Frame> {
-    use jxl_oxide::{AllocTracker, InitializeResult, JxlImage};
-    let mut uninit = JxlImage::builder()
-        .alloc_tracker(AllocTracker::with_limit(limits.max_codec_bytes))
-        .build_uninit();
-    let mut cursor = 0;
-    let mut image = loop {
-        if cursor == bytes.len() {
-            return Err(DecodeError::Truncated);
-        }
-        let end = (cursor + 4096).min(bytes.len());
-        let consumed = uninit
-            .feed_bytes(&bytes[cursor..end])
-            .map_err(|_| DecodeError::InvalidContainer)?;
-        if consumed == 0 {
-            return Err(DecodeError::InvalidContainer);
-        }
-        cursor += consumed;
-        match uninit
-            .try_init()
-            .map_err(|_| DecodeError::InvalidContainer)?
-        {
-            InitializeResult::NeedMoreData(next) => uninit = next,
-            InitializeResult::Initialized(image) => break image,
-        }
-    };
+    let (mut image, mut cursor) = initialize_jpeg_xl(bytes, limits)?;
     let header = image.image_header();
     let metadata = &header.metadata;
     let depth = match metadata.bit_depth {
@@ -215,17 +191,7 @@ fn jpeg_xl(bytes: &[u8], spec: TileSpec, limits: DecodeLimits) -> ProbeResult<Fr
             if stream.write_to_buffer(&mut pixel[..count]) != count {
                 return Err(DecodeError::InvalidContainer);
             }
-            let (column, row) = match render.orientation() {
-                1 => (x, y),
-                2 => (width - x - 1, y),
-                3 => (width - x - 1, height - y - 1),
-                4 => (x, height - y - 1),
-                5 => (y, x),
-                6 => (y, width - x - 1),
-                7 => (height - y - 1, width - x - 1),
-                8 => (height - y - 1, x),
-                _ => return Err(DecodeError::InvalidContainer),
-            };
+            let (column, row) = unoriented_position([x, y], [width, height], render.orientation())?;
             let offset = (row as usize * spec.width as usize + column as usize) * count;
             for channel in 0..count {
                 samples[offset + channel] = if spec.bits == 8 {
@@ -240,4 +206,53 @@ fn jpeg_xl(bytes: &[u8], spec: TileSpec, limits: DecodeLimits) -> ProbeResult<Fr
         samples,
         component_ids: (1..=spec.channels as u8).collect(),
     })
+}
+
+fn initialize_jpeg_xl(
+    bytes: &[u8],
+    limits: DecodeLimits,
+) -> ProbeResult<(jxl_oxide::JxlImage, usize)> {
+    use jxl_oxide::{AllocTracker, InitializeResult, JxlImage};
+    let mut uninit = JxlImage::builder()
+        .alloc_tracker(AllocTracker::with_limit(limits.max_codec_bytes))
+        .build_uninit();
+    let mut cursor = 0;
+    loop {
+        if cursor == bytes.len() {
+            return Err(DecodeError::Truncated);
+        }
+        let end = (cursor + 4096).min(bytes.len());
+        let consumed = uninit
+            .feed_bytes(&bytes[cursor..end])
+            .map_err(|_| DecodeError::InvalidContainer)?;
+        if consumed == 0 {
+            return Err(DecodeError::InvalidContainer);
+        }
+        cursor += consumed;
+        match uninit
+            .try_init()
+            .map_err(|_| DecodeError::InvalidContainer)?
+        {
+            InitializeResult::NeedMoreData(next) => uninit = next,
+            InitializeResult::Initialized(image) => return Ok((image, cursor)),
+        }
+    }
+}
+
+fn unoriented_position(
+    [x, y]: [u32; 2],
+    [width, height]: [u32; 2],
+    orientation: u32,
+) -> ProbeResult<(u32, u32)> {
+    match orientation {
+        1 => Ok((x, y)),
+        2 => Ok((width - x - 1, y)),
+        3 => Ok((width - x - 1, height - y - 1)),
+        4 => Ok((x, height - y - 1)),
+        5 => Ok((y, x)),
+        6 => Ok((y, width - x - 1)),
+        7 => Ok((height - y - 1, width - x - 1)),
+        8 => Ok((height - y - 1, x)),
+        _ => Err(DecodeError::InvalidContainer),
+    }
 }

@@ -363,8 +363,6 @@ impl<'a> Dng<'a> {
             None => None,
         };
         let metadata = own_metadata(self.bytes, &self.facts)?;
-        let has_gain_table =
-            self.facts.profile_gain_table_map.is_some() || metadata.root().tag(52544).is_some();
         Ok(DngDecodedImage {
             image: LinearRawImage {
                 width: self.facts.width,
@@ -396,54 +394,7 @@ impl<'a> Dng<'a> {
                 default_crop_size: self.facts.default_crop_size,
                 profile_gain_table_map,
                 samples,
-                processing: LinearRawProcessingState {
-                    linearization: if self.facts.linearization_table.is_some() {
-                        LinearRawProcessing::Applied
-                    } else {
-                        LinearRawProcessing::NotPresent
-                    },
-                    black_subtraction: LinearRawProcessing::Applied,
-                    white_normalization: LinearRawProcessing::Applied,
-                    white_balance: LinearRawProcessing::Unapplied,
-                    color_conversion: LinearRawProcessing::Unapplied,
-                    default_crop: if self.facts.active_area.is_some()
-                        || self.facts.default_crop_origin_exact.is_some()
-                        || self.facts.default_crop_size_exact.is_some()
-                    {
-                        LinearRawProcessing::Unapplied
-                    } else {
-                        LinearRawProcessing::NotPresent
-                    },
-                    orientation: if self.facts.orientation.is_some_and(|value| value != 1) {
-                        LinearRawProcessing::Unapplied
-                    } else {
-                        LinearRawProcessing::NotPresent
-                    },
-                    baseline_exposure: if self.facts.has_baseline_exposure {
-                        LinearRawProcessing::Unapplied
-                    } else {
-                        LinearRawProcessing::NotPresent
-                    },
-                    profile_tone_curve: if self.facts.has_profile_tone_curve {
-                        LinearRawProcessing::Unapplied
-                    } else {
-                        LinearRawProcessing::NotPresent
-                    },
-                    demosaic: LinearRawProcessing::NotPresent,
-                    opcode_list_1: opcode_processing[0],
-                    opcode_list_2: opcode_processing[1],
-                    opcode_list_3: opcode_processing[2],
-                    profile_gain_table_map: if has_gain_table {
-                        LinearRawProcessing::Unapplied
-                    } else {
-                        LinearRawProcessing::NotPresent
-                    },
-                    semantic_masks: if self.facts.has_semantic_masks {
-                        LinearRawProcessing::Unapplied
-                    } else {
-                        LinearRawProcessing::NotPresent
-                    },
-                },
+                processing: self.processing_state(opcode_processing, &metadata),
             },
             metadata,
             default_crop_origin_exact: self.facts.default_crop_origin_exact,
@@ -457,6 +408,63 @@ impl<'a> Dng<'a> {
                 Vec::new()
             },
         })
+    }
+
+    fn processing_state(
+        &self,
+        opcode_processing: [LinearRawProcessing; 3],
+        metadata: &DngMetadata,
+    ) -> LinearRawProcessingState {
+        let has_gain_table =
+            self.facts.profile_gain_table_map.is_some() || metadata.root().tag(52544).is_some();
+        LinearRawProcessingState {
+            linearization: if self.facts.linearization_table.is_some() {
+                LinearRawProcessing::Applied
+            } else {
+                LinearRawProcessing::NotPresent
+            },
+            black_subtraction: LinearRawProcessing::Applied,
+            white_normalization: LinearRawProcessing::Applied,
+            white_balance: LinearRawProcessing::Unapplied,
+            color_conversion: LinearRawProcessing::Unapplied,
+            default_crop: if self.facts.active_area.is_some()
+                || self.facts.default_crop_origin_exact.is_some()
+                || self.facts.default_crop_size_exact.is_some()
+            {
+                LinearRawProcessing::Unapplied
+            } else {
+                LinearRawProcessing::NotPresent
+            },
+            orientation: if self.facts.orientation.is_some_and(|value| value != 1) {
+                LinearRawProcessing::Unapplied
+            } else {
+                LinearRawProcessing::NotPresent
+            },
+            baseline_exposure: if self.facts.has_baseline_exposure {
+                LinearRawProcessing::Unapplied
+            } else {
+                LinearRawProcessing::NotPresent
+            },
+            profile_tone_curve: if self.facts.has_profile_tone_curve {
+                LinearRawProcessing::Unapplied
+            } else {
+                LinearRawProcessing::NotPresent
+            },
+            demosaic: LinearRawProcessing::NotPresent,
+            opcode_list_1: opcode_processing[0],
+            opcode_list_2: opcode_processing[1],
+            opcode_list_3: opcode_processing[2],
+            profile_gain_table_map: if has_gain_table {
+                LinearRawProcessing::Unapplied
+            } else {
+                LinearRawProcessing::NotPresent
+            },
+            semantic_masks: if self.facts.has_semantic_masks {
+                LinearRawProcessing::Unapplied
+            } else {
+                LinearRawProcessing::NotPresent
+            },
+        }
     }
 
     fn opcode_lists(&self) -> ProbeResult<[Option<OpcodeList>; 3]> {

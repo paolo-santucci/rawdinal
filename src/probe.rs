@@ -493,34 +493,7 @@ impl<'a> Parser<'a> {
             let kind = self.reader.u16(entry + 2)?;
             let count = self.reader.u32(entry + 4)?;
             let value = entry + 8;
-            if self.retain_metadata {
-                let size = type_size(kind)?
-                    .checked_mul(count as usize)
-                    .ok_or(DecodeError::ResourceLimit)?;
-                self.metadata_bytes = self
-                    .metadata_bytes
-                    .checked_add(size)
-                    .ok_or(DecodeError::ResourceLimit)?;
-                if self.metadata_bytes > self.limits.max_metadata_bytes {
-                    return Err(DecodeError::ResourceLimit);
-                }
-                let start = if size <= 4 {
-                    value
-                } else {
-                    self.reader.offset(value)?
-                };
-                self.reader.bytes(start, size)?;
-                directory
-                    .tags
-                    .try_reserve(1)
-                    .map_err(|_| DecodeError::Allocation)?;
-                directory.tags.push(TagRange {
-                    id: tag,
-                    field_type: kind,
-                    count,
-                    range: start..start + size,
-                });
-            }
+            self.retain_metadata_tag(&mut directory, entry)?;
             match tag {
                 TAG_DNG_VERSION if is_ifd0 => {
                     self.dng_version = Some(self.version(value, kind, count)?)
@@ -679,6 +652,47 @@ impl<'a> Parser<'a> {
         if next_ifd != 0 {
             self.push_work(work, next_ifd, false, parent)?;
         }
+        Ok(())
+    }
+
+    fn retain_metadata_tag(
+        &mut self,
+        directory: &mut DirectoryRange,
+        entry: usize,
+    ) -> ProbeResult<()> {
+        if !self.retain_metadata {
+            return Ok(());
+        }
+        let id = self.reader.u16(entry)?;
+        let field_type = self.reader.u16(entry + 2)?;
+        let count = self.reader.u32(entry + 4)?;
+        let value = entry + 8;
+        let size = type_size(field_type)?
+            .checked_mul(count as usize)
+            .ok_or(DecodeError::ResourceLimit)?;
+        self.metadata_bytes = self
+            .metadata_bytes
+            .checked_add(size)
+            .ok_or(DecodeError::ResourceLimit)?;
+        if self.metadata_bytes > self.limits.max_metadata_bytes {
+            return Err(DecodeError::ResourceLimit);
+        }
+        let start = if size <= 4 {
+            value
+        } else {
+            self.reader.offset(value)?
+        };
+        self.reader.bytes(start, size)?;
+        directory
+            .tags
+            .try_reserve(1)
+            .map_err(|_| DecodeError::Allocation)?;
+        directory.tags.push(TagRange {
+            id,
+            field_type,
+            count,
+            range: start..start + size,
+        });
         Ok(())
     }
 

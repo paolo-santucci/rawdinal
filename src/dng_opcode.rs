@@ -227,53 +227,60 @@ impl Mapping {
                             .get(index)
                             .ok_or(DecodeError::InvalidGeometry)?,
                     );
-                    let y = (row - area.bounds[0] as usize) / area.pitch[0];
-                    let x = (column - area.bounds[1] as usize) / area.pitch[1];
-                    let scale = if stage.number == 1 { 65535.0 } else { 1.0 };
-                    let value = match self {
-                        Self::Table(table) => {
-                            let index = if stage.number == 1 {
-                                sample
-                            } else {
-                                sample * 65535.0
-                            };
-                            f64::from(
-                                table[(index.clamp(0.0, 65535.0).round() as usize)
-                                    .min(table.len() - 1)],
-                            ) / if stage.number == 1 { 1.0 } else { 65535.0 }
-                        }
-                        Self::Polynomial(coefficients) => {
-                            let value = coefficients
-                                .iter()
-                                .skip(1)
-                                .rev()
-                                .fold(0.0, |value, &coefficient| {
-                                    value * sample.abs() + coefficient
-                                })
-                                * sample.abs();
-                            (coefficients[0] + sample.signum() * value).clamp(-scale, scale)
-                        }
-                        Self::Gain(map) => {
-                            (sample * map.gain(row, column, channel, stage.bounds)).min(scale)
-                        }
-                        Self::RowDelta(values) => (sample + values[y]).clamp(-scale, scale),
-                        Self::ColumnDelta(values) => (sample + values[x]).clamp(-scale, scale),
-                        Self::RowScale(values) => (sample * values[y]).clamp(-scale, scale),
-                        Self::ColumnScale(values) => (sample * values[x]).clamp(-scale, scale),
-                    };
-                    let value = if stage.number == 1 {
-                        value.clamp(0.0, 65535.0).round()
-                    } else {
-                        value
-                    };
-                    if !value.is_finite() {
-                        return Err(DecodeError::InvalidTag);
-                    }
-                    stage.samples[index] = value as f32;
+                    stage.samples[index] =
+                        self.map_sample(sample, [row, column, channel], area, stage)?;
                 }
             }
         }
         Ok(())
+    }
+
+    fn map_sample(
+        &self,
+        sample: f64,
+        [row, column, channel]: [usize; 3],
+        area: Area,
+        stage: &Stage<'_>,
+    ) -> ProbeResult<f32> {
+        let y = (row - area.bounds[0] as usize) / area.pitch[0];
+        let x = (column - area.bounds[1] as usize) / area.pitch[1];
+        let scale = if stage.number == 1 { 65535.0 } else { 1.0 };
+        let value = match self {
+            Self::Table(table) => {
+                let index = if stage.number == 1 {
+                    sample
+                } else {
+                    sample * 65535.0
+                };
+                f64::from(table[(index.clamp(0.0, 65535.0).round() as usize).min(table.len() - 1)])
+                    / if stage.number == 1 { 1.0 } else { 65535.0 }
+            }
+            Self::Polynomial(coefficients) => {
+                let value = coefficients
+                    .iter()
+                    .skip(1)
+                    .rev()
+                    .fold(0.0, |value, &coefficient| {
+                        value * sample.abs() + coefficient
+                    })
+                    * sample.abs();
+                (coefficients[0] + sample.signum() * value).clamp(-scale, scale)
+            }
+            Self::Gain(map) => (sample * map.gain(row, column, channel, stage.bounds)).min(scale),
+            Self::RowDelta(values) => (sample + values[y]).clamp(-scale, scale),
+            Self::ColumnDelta(values) => (sample + values[x]).clamp(-scale, scale),
+            Self::RowScale(values) => (sample * values[y]).clamp(-scale, scale),
+            Self::ColumnScale(values) => (sample * values[x]).clamp(-scale, scale),
+        };
+        let value = if stage.number == 1 {
+            value.clamp(0.0, 65535.0).round()
+        } else {
+            value
+        };
+        if !value.is_finite() {
+            return Err(DecodeError::InvalidTag);
+        }
+        Ok(value as f32)
     }
 }
 
