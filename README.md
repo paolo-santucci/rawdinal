@@ -37,6 +37,16 @@ The original 164-file validation corpus (59 Merrill, 100 dp3 Quattro, and 5 sd Q
 
 The raw.pixls.us corpus also contains six unsupported legacy files: DP1, DP1s, SD9, SD10, SD14 and SD15. Tests check that decoding rejects them. In particular, legacy RAW type 3 / TRUE `0x1e` is distinct from Merrill RAW type 1 / TRUE `0x1e`. Rawdinal is not a general Foveon converter and does not provide calibrated rendering for Merrill, dp Quattro or sd Quattro H cameras.
 
+Metadata-only access is available for the observed SD9, SD10 and SD14 layouts: X3F 2.1/2.2, RAW type 3 / format `0x06`, and CAMF type 2. `X3f::parse` retains legacy RAW sections (`IMAG` on the SD9/SD10 originals, `IMA2` on SD14); `camf_bytes()` decrypts their payload and `calibration()` parses its entries. Both `sensor_format()` and `decode()` reject RAW type 3. Legacy DP1/DP1s/SD15 CAMF type 4 access is still unsupported.
+
+Parsing a container does not imply sensor-decoding support. To extract supported CAMF metadata without decoding pixels, use the existing example:
+
+```sh
+cargo run --locked --example dump_camf -- INPUT.x3f OUTPUT.camf
+```
+
+The output must not already exist. CAMF-2 extraction returns exactly the decrypted section payload, with no synthetic trailing padding. It is checked against three hash-identified originals; these checks do not establish calibration semantics. The `rawdinal-inspect` command still attempts sensor decoding and therefore fails on these legacy files after inspecting their metadata.
+
 For the original sd Quattro, the experimental renderer offers bilinear or guided reconstruction and unbounded linear-sRGB output. It omits display tone mapping and sharpening. Optional clipping masks record contributing samples at their estimated encoded maxima; these are not measurements of physical sensor saturation.
 
 ## Apple ProRAW DNG
@@ -163,6 +173,14 @@ X3F_PIXLS_REFERENCE_DIR=.opencode/x3f-references/raw-pixls-us \
   pixls_corpus_matches_independent_references_and_rejects_unsupported_formats -- --ignored --exact
 ```
 
+The CAMF-2 test uses the SD9, SD10 and SD14 originals from the same corpus. It verifies their source hashes, decrypted payload hashes and parsed entry counts (48, 54 and 94), and checks that sensor decoding remains unsupported. The expected hashes are included in the test:
+
+```sh
+X3F_PIXLS_SAMPLE_DIR=.opencode/x3f-samples/raw-pixls-us \
+  cargo test --release --locked -p rawdinal --test camf_legacy \
+  legacy_camf2_matches_known_payload_hashes -- --ignored --exact
+```
+
 ### ProRAW
 
 The default tests use synthetic fixtures. To exercise your own supported ProRAW files, run the ignored corpus test:
@@ -203,7 +221,13 @@ X3F_SAMPLE_DIR=.opencode/x3f-samples \
 
 This requires the five original `20220305-of_intermedio_ritratto-001.x3f` through `-005.x3f` files and `raw-pixls-us/sd Quattro/sample3.X3F`, relative to the sample directory. It needs no external decoder or comparison dumps. Output reports accepted/excluded sample counts and residual bias, RMS and 95th-percentile absolute error in native code units.
 
+Additional `causes` rows distinguish CAMF bad-pixel locations (bit 1), the hard-coded AF grid (bit 2), direct estimated encoded-maximum clipping (bit 4), and clipped-donor influence at a repaired location (bit 8). They report marginal counts, the number with multiple causes, and a 16-bin exact-combination histogram. Marginal counts overlap; histogram bin 0 is clear, and bins 1–15 partition the flagged population. A defective source code is excluded from direct clipping observations; the repair flag means a donor used by the repair was clipped, rather than that every repair is clipped.
+
+The `native-full-plane` scope counts each encoded plane, including dark shields. `projected-common` counts the native lower-plane coordinates eligible for evaluation, after propagating causes through the common interpolation and regression support used by both methods. These populations have different dimensions and must not be summed together. If every candidate coordinate is excluded, the diagnostic reports its counts with `NA` residual statistics.
+
 The diagnostic uses the renderer's half-pixel alignment and an assumed 2×2 averaging footprint. Both methods are evaluated on the same pixels, excluding support that touches known defects or estimated encoded maxima. These are conditional data-consistency measurements, not calibrated reconstruction accuracy: camera noise, excluded regions and the assumed sampling model limit their interpretation. Synthetic tests also characterize suppression of lower-plane detail absent from a flat top-layer guide.
+
+A private, test-only restoration model operates on explicit intermediate buffers. Its synthetic tests cover constant fields, weighting phases, highlight transitions, nonpositive signal handling, invalid geometry and nonfinite arithmetic. It is not a public reconstruction option or a complete camera renderer.
 
 ## C API ownership
 
@@ -218,11 +242,11 @@ Use the matching free function for each handle. See the header for pointer valid
 
 The X3F parser limits input to 512 MiB and 64 non-overlapping sections. Decoding accepts only the sensor geometries listed above. Before allocating sensor planes, it checks every plane's byte range and whether its entropy stream can hold the declared samples. Invalid Huffman codes, truncated differences and out-of-range predictors return errors.
 
-CAMF decompression is capped at 32 MiB. Calibration parsing also limits expanded matrix values to 32 MiB in total, with at most 4,096 entries, 4,096 properties per entry, 65,536 properties across all entries and a 4 MiB aggregate property-string budget, including terminators. Matrix payloads and property strings must follow their descriptors and offset tables. These bounds cover individual decoding operations, not total process memory or concurrent callers.
+CAMF extraction is capped at 32 MiB for decrypted type-2 payloads and decompressed type-4/5 payloads. Calibration parsing also limits expanded matrix values to 32 MiB in total, with at most 4,096 entries, 4,096 properties per entry, 65,536 properties across all entries and a 4 MiB aggregate property-string budget, including terminators. Matrix payloads and property strings must follow their descriptors and offset tables. These bounds cover individual decoding operations, not total process memory or concurrent callers.
 
 The default test suite exercises truncated sections with intact directories, hostile offsets and lengths, metadata expansion limits, malformed JPEG/EXIF and deterministic byte mutations. Native-size fixtures reach RAW entropy validation for every supported format. C-interface regressions check that malformed inputs return an input error rather than a caught panic, clear image outputs and terminate error messages.
 
-Validation is staged: `X3f::parse` checks the container; `decode`, `calibration` and metadata accessors validate the data they consume. `preview` borrows JPEG bytes without validating the whole JPEG, and `camf_bytes` decompresses CAMF without interpreting its entries. The sensor C API likewise returns uninterpreted CAMF and treats unreadable optional EXIF as absent. Successful decoding cannot detect every byte alteration that still describes valid samples or metadata. The mutation tests are regression coverage, not an exhaustive fuzzing or security guarantee.
+Validation is staged: `X3f::parse` checks the container; `decode`, `calibration` and metadata accessors validate the data they consume. `preview` borrows JPEG bytes without validating the whole JPEG, and `camf_bytes` extracts CAMF without interpreting its entries. CAMF-2 has no integrity check: shortened or altered payloads may extract successfully but fail entry parsing. The sensor C API likewise returns uninterpreted CAMF and treats unreadable optional EXIF as absent. Successful decoding cannot detect every byte alteration that still describes valid samples or metadata. The mutation tests are regression coverage, not an exhaustive fuzzing or security guarantee.
 
 ## License
 
