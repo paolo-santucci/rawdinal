@@ -16,6 +16,8 @@ use defects::marked_pixels;
 
 #[cfg(test)]
 mod diagnostics;
+#[cfg(test)]
+mod stage2b;
 
 pub struct LinearImage {
     pub width: usize,
