@@ -116,9 +116,7 @@ impl<'a> X3f<'a> {
                     }
                     if section.u32(8)? == 2 && section.u32(12)? == 0x12 {
                         section.bytes(0, 28)?;
-                        if jpeg.is_none() {
-                            jpeg = Some(Reader(&section.0[28..]));
-                        }
+                        jpeg.get_or_insert(Reader(&section.0[28..]));
                     }
                 }
                 b"IMAG" if matches!(version, 0x0002_0001 | 0x0002_0002) => {
