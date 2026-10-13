@@ -11,6 +11,9 @@
 
 use crate::{Calibration, Plane, Result, SensorImage, invalid, zeroed};
 
+mod defects;
+use defects::marked_pixels;
+
 #[cfg(test)]
 mod diagnostics;
 
@@ -163,7 +166,7 @@ fn render_internal(
                     if let Some(influence) = &coefficients[channel].influence {
                         let support =
                             interpolation_support(low_x, low_y, bottom.width, bottom.height);
-                        clipped |= support_has_influence(&support, influence);
+                        clipped |= support_influence(&support, influence) != 0;
                     }
                 }
             } else if track_clipping {
@@ -300,10 +303,10 @@ fn calibrate(
     Ok((layer, mask))
 }
 
-fn source_clipping_mask(samples: &[u16], threshold: u16, marked: &[bool]) -> Result<Vec<u8>> {
+fn source_clipping_mask(samples: &[u16], threshold: u16, marked: &[u8]) -> Result<Vec<u8>> {
     let mut mask = zeroed(samples.len())?;
     for ((flag, &sample), &bad) in mask.iter_mut().zip(samples).zip(marked) {
-        *flag = u8::from(sample >= threshold && !bad);
+        *flag = u8::from(sample >= threshold && bad == 0);
     }
     Ok(mask)
 }
@@ -339,59 +342,10 @@ fn measure_black(plane: &Plane, columns: [usize; 4]) -> Result<(f32, f32)> {
     Ok((black as f32, (squared / weight as f64) as f32))
 }
 
-fn marked_pixels(plane: &Plane, calibration: &Calibration, channel: usize) -> Result<Vec<bool>> {
-    let name = if channel == 2 {
-        "BadPixelsLumaF23"
-    } else {
-        "BadPixelsChromaF23"
-    };
-    let mut marked: Vec<bool> = zeroed(plane.samples.len())?;
-    let table = &calibration.matrix(name)?.values;
-    let mut position = 0;
-    while position < table.len() {
-        let row = table[position] as usize;
-        if table[position].fract() != 0.0 || table[position] < 0.0 || row >= plane.height {
-            return Err(invalid("invalid bad-pixel row"));
-        }
-        position += 1;
-        loop {
-            let &column = table
-                .get(position)
-                .ok_or_else(|| invalid("truncated bad-pixel list"))?;
-            position += 1;
-            if column == 0.0 {
-                break;
-            }
-            if column.fract() != 0.0
-                || column < 0.0
-                || column as usize >= plane.width
-                || position >= table.len()
-            {
-                return Err(invalid("invalid bad-pixel column"));
-            }
-            marked[row * plane.width + column as usize] = true;
-            position += 1;
-        }
-    }
-    let (x0, x1, dx, y0, y1, dy, rows) = if channel == 2 {
-        (217, 5641, 16, 464, 3312, 32, 2)
-    } else {
-        (108, 2820, 8, 232, 1656, 16, 1)
-    };
-    for y in (y0..=y1).step_by(dy) {
-        for x in (x0..=x1).step_by(dx) {
-            for row in y..y + rows {
-                marked[row * plane.width + x] = true;
-            }
-        }
-    }
-    Ok(marked)
-}
-
-fn repair_pixels(layer: &mut Layer, marked: &[bool]) -> Result<()> {
+fn repair_pixels(layer: &mut Layer, marked: &[u8]) -> Result<()> {
     let mut repaired = Vec::new();
     for (index, &bad) in marked.iter().enumerate() {
-        if !bad {
+        if bad == 0 {
             continue;
         }
         let (x, y) = (index % layer.width, index / layer.width);
@@ -418,19 +372,13 @@ fn repair_pixels(layer: &mut Layer, marked: &[bool]) -> Result<()> {
     Ok(())
 }
 
-fn repair_ring(
-    layer: &Layer,
-    marked: &[bool],
-    x: usize,
-    y: usize,
-    radius: usize,
-) -> (f32, f32, u8) {
+fn repair_ring(layer: &Layer, marked: &[u8], x: usize, y: usize, radius: usize) -> (f32, f32, u8) {
     let mut sum = 0.0;
     let mut weight = 0.0;
     let mut influence = 0;
     for ny in y.saturating_sub(radius)..=(y + radius).min(layer.height - 1) {
         for nx in x.saturating_sub(radius)..=(x + radius).min(layer.width - 1) {
-            if nx.abs_diff(x).max(ny.abs_diff(y)) != radius || marked[ny * layer.width + nx] {
+            if nx.abs_diff(x).max(ny.abs_diff(y)) != radius || marked[ny * layer.width + nx] != 0 {
                 continue;
             }
             let w = 1.0 / ((nx as f32 - x as f32).powi(2) + (ny as f32 - y as f32).powi(2));
@@ -492,12 +440,10 @@ fn downsample(top: &Layer) -> Result<Layer> {
         if let (Some(source_influence), Some(destination_influence)) =
             (&top.influence, &mut influence)
         {
-            destination_influence[index] = u8::from(
-                source_influence[source] != 0
-                    || source_influence[source + 1] != 0
-                    || source_influence[source + top.width] != 0
-                    || source_influence[source + top.width + 1] != 0,
-            );
+            destination_influence[index] = source_influence[source]
+                | source_influence[source + 1]
+                | source_influence[source + top.width]
+                | source_influence[source + top.width + 1];
         }
     }
     Ok(Layer {
@@ -596,19 +542,20 @@ fn interpolation_support(x: f32, y: f32, width: usize, height: usize) -> Interpo
 
 fn bilinear_supports_clipping(layer: &Layer, x: f32, y: f32) -> bool {
     layer.influence.as_ref().is_some_and(|influence| {
-        support_has_influence(
+        support_influence(
             &interpolation_support(x, y, layer.width, layer.height),
             influence,
-        )
+        ) != 0
     })
 }
 
-fn support_has_influence(support: &InterpolationSupport, influence: &[u8]) -> bool {
+fn support_influence(support: &InterpolationSupport, influence: &[u8]) -> u8 {
     support
         .indices
         .iter()
         .zip(support.weights)
-        .any(|(&index, weight)| weight > 0.0 && influence[index] != 0)
+        .filter(|&(_, weight)| weight > 0.0)
+        .fold(0, |flags, (&index, _)| flags | influence[index])
 }
 
 impl Layer {
@@ -699,7 +646,7 @@ mod tests {
     #[test]
     fn encoded_maximum_masks_include_the_threshold_but_exclude_known_defects() {
         assert_eq!(
-            source_clipping_mask(&[1022, 1023, 1024], 1023, &[false, true, false]).unwrap(),
+            source_clipping_mask(&[1022, 1023, 1024], 1023, &[0, defects::BAD_PIXEL, 0]).unwrap(),
             [0, 0, 1]
         );
     }
@@ -713,7 +660,7 @@ mod tests {
             noise_variance: 0.0,
             influence: Some(vec![1, 0, 0]),
         };
-        repair_pixels(&mut layer, &[false, true, false]).unwrap();
+        repair_pixels(&mut layer, &[0, defects::BAD_PIXEL, 0]).unwrap();
         assert_eq!(layer.influence.unwrap(), [1, 1, 0]);
     }
 
@@ -760,5 +707,61 @@ mod tests {
         };
         let regression = local_regression(&guide, &clear_source).unwrap();
         assert_eq!(regression.influence.as_ref().unwrap()[0], 1);
+    }
+
+    #[test]
+    fn downsample_preserves_distinct_influence_bits() {
+        let top = Layer {
+            width: 2,
+            height: 2,
+            pixels: vec![0.5; 4],
+            noise_variance: 0.0,
+            influence: Some(vec![1, 2, 4, 8]),
+        };
+        let guide = downsample(&top).unwrap();
+        assert_eq!(guide.influence.unwrap(), [15]);
+        assert_eq!(guide.pixels, [0.5]);
+    }
+
+    #[test]
+    fn support_union_ignores_zero_weight_cause_bits() {
+        let influence = [1, 2, 4, 8];
+        for (x, y, expected) in [(0.0, 0.0, 1), (0.5, 0.0, 3), (0.5, 0.5, 15), (1.0, 1.0, 8)] {
+            let support = interpolation_support(x, y, 2, 2);
+            assert_eq!(support_influence(&support, &influence), expected);
+        }
+    }
+
+    #[test]
+    fn all_defect_causes_exclude_source_clipping_without_leaking_into_public_masks() {
+        let mask = source_clipping_mask(
+            &[1023, 1024, 1023, 1022, 1024],
+            1023,
+            &[
+                defects::BAD_PIXEL,
+                defects::AF_PIXEL,
+                defects::BAD_PIXEL | defects::AF_PIXEL,
+                0,
+                0,
+            ],
+        )
+        .unwrap();
+        assert_eq!(mask, [0, 0, 0, 0, 1]);
+        for cause in [
+            defects::BAD_PIXEL,
+            defects::AF_PIXEL,
+            defects::BAD_PIXEL | defects::AF_PIXEL,
+        ] {
+            let mut layer = Layer {
+                width: 3,
+                height: 1,
+                pixels: vec![0.25, 1.0, 0.75],
+                noise_variance: 0.0,
+                influence: Some(vec![1, 0, 0]),
+            };
+            repair_pixels(&mut layer, &[0, cause, 0]).unwrap();
+            assert_eq!(layer.pixels, [0.25, 0.5, 0.75]);
+            assert_eq!(layer.influence.unwrap(), [1, 1, 0]);
+        }
     }
 }
