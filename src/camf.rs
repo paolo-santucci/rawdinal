@@ -10,6 +10,8 @@ use crate::{
 };
 use std::collections::BTreeMap;
 
+mod type2;
+
 const MAX_CALIBRATION_BYTES: usize = 32 * 1024 * 1024;
 const MAX_PROPERTY_STRING_BYTES: usize = 4 * 1024 * 1024;
 const MAX_MATRIX_VALUES: usize = MAX_CALIBRATION_BYTES / size_of::<f64>();
@@ -134,6 +136,7 @@ pub(crate) fn decompress(section: Reader<'_>) -> Result<Vec<u8>> {
         return Err(invalid("unsupported CAMF section version"));
     }
     match section.u32(8)? {
+        2 => type2::decrypt(section),
         4 => decompress_type4(section),
         5 => decompress_type5(section),
         _ => Err(invalid("unsupported CAMF type")),
