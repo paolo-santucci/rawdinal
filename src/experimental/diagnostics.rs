@@ -6,11 +6,15 @@
 
 use super::{
     Crop, InterpolationSupport, Layer, Regression, calibrate, downsample, interpolation_support,
-    local_regression, marked_pixels, measure_black, sample_coefficients, support_has_influence,
+    local_regression, marked_pixels, measure_black, sample_coefficients, support_influence,
     validate_geometry,
 };
 use crate::{Calibration, Plane, X3f};
 use std::path::Path;
+
+mod exclusions;
+use super::defects::{AF_PIXEL, BAD_PIXEL};
+use exclusions::{Counts, ENCODED_MAXIMUM, REPAIR_CLIPPED_DONOR, attribute_sources};
 
 struct Projection<'a> {
     source: &'a Layer,
@@ -22,7 +26,7 @@ struct Projection<'a> {
 struct ProjectedSample {
     bilinear: f32,
     guided: f32,
-    excluded: bool,
+    causes: u8,
 }
 
 impl Projection<'_> {
@@ -44,27 +48,27 @@ impl Projection<'_> {
                 let top_index = sy * self.top.width + sx;
                 sample.bilinear += self.source.sample(low_x, low_y) * 0.25;
                 sample.guided += (slope * self.top.pixels[top_index] + intercept) * 0.25;
-                sample.excluded |= self.excluded(&support, top_index);
+                sample.causes |= self.causes(&support, top_index);
             }
         }
         sample
     }
 
-    fn excluded(&self, support: &InterpolationSupport, top_index: usize) -> bool {
+    fn causes(&self, support: &InterpolationSupport, top_index: usize) -> u8 {
         self.top
             .influence
             .as_ref()
-            .is_some_and(|mask| mask[top_index] != 0)
-            || self
+            .map_or(0, |mask| mask[top_index])
+            | self
                 .source
                 .influence
                 .as_ref()
-                .is_some_and(|mask| support_has_influence(support, mask))
-            || self
+                .map_or(0, |mask| support_influence(support, mask))
+            | self
                 .regression
                 .influence
                 .as_ref()
-                .is_some_and(|mask| support_has_influence(support, mask))
+                .map_or(0, |mask| support_influence(support, mask))
     }
 }
 
@@ -91,30 +95,32 @@ impl Residuals {
         self.absolute.push(residual.abs());
     }
 
-    fn summarize(mut self) -> Summary {
+    fn summarize(mut self) -> Option<Summary> {
         let count = self.absolute.len();
-        assert!(count > 0, "no unmasked native samples");
+        if count == 0 {
+            return None;
+        }
         let percentile = (count * 95).div_ceil(100) - 1;
         let (_, &mut p95, _) = self
             .absolute
             .select_nth_unstable_by(percentile, f64::total_cmp);
-        Summary {
+        Some(Summary {
             count,
             bias: self.sum / count as f64,
             rms: (self.squared / count as f64).sqrt(),
             p95,
-        }
+        })
     }
 }
 
 fn diagnostic_layer(plane: &Plane, calibration: &Calibration, channel: usize) -> Layer {
     let (mut layer, clipping) = calibrate(plane, calibration, channel, true).unwrap();
     let marked = marked_pixels(plane, calibration, channel).unwrap();
-    let mut excluded = clipping.unwrap().mask;
-    for (flag, bad) in excluded.iter_mut().zip(marked) {
-        *flag |= u8::from(bad);
-    }
-    layer.influence = Some(excluded);
+    attribute_sources(
+        &marked,
+        &clipping.unwrap().mask,
+        layer.influence.as_mut().unwrap(),
+    );
     layer
 }
 
@@ -129,16 +135,16 @@ fn measure_projection(
     projection: &Projection<'_>,
     crop: Crop,
     scale: f64,
-) -> (usize, [Summary; 2]) {
+) -> (Counts, [Option<Summary>; 2]) {
     let mut bilinear = Residuals::default();
     let mut guided = Residuals::default();
-    let mut excluded = 0;
+    let mut counts = Counts::default();
     let columns = native_interior(crop.left, crop.right);
     for y in native_interior(crop.top, crop.bottom) {
         for x in columns.clone() {
             let sample = projection.sample(x, y);
-            if sample.excluded {
-                excluded += 1;
+            counts.record(sample.causes);
+            if sample.causes != 0 {
                 continue;
             }
             let reference = projection.source.pixels[y * projection.source.width + x];
@@ -146,7 +152,7 @@ fn measure_projection(
             guided.record(reference, sample.guided, scale);
         }
     }
-    (excluded, [bilinear.summarize(), guided.summarize()])
+    (counts, [bilinear.summarize(), guided.summarize()])
 }
 
 fn native_interior(first: usize, last: usize) -> std::ops::Range<usize> {
@@ -172,18 +178,30 @@ fn report_sample(path: &Path) {
     )
     .unwrap();
     let top = diagnostic_layer(&sensor.layers[2], &calibration, 2);
+    report_native_counts(path, 2, &top);
     let guide = downsample(&top).unwrap();
     for (channel, plane) in sensor.layers[..2].iter().enumerate() {
         let source = diagnostic_layer(plane, &calibration, channel);
+        report_native_counts(path, channel, &source);
         let regression = local_regression(&guide, &source).unwrap();
         let projection = Projection {
             source: &source,
             top: &top,
             regression: &regression,
         };
-        let (excluded, summaries) =
+        let (counts, summaries) =
             measure_projection(&projection, crop, codes_per_unit(plane, &calibration));
+        let excluded = counts.excluded();
+        report_counts(path, channel, "projected-common", &counts);
         for (method, summary) in ["bilinear", "guided"].into_iter().zip(summaries) {
+            let Some(summary) = summary else {
+                eprintln!(
+                    "{}\t{channel}\t{method}\t0\t{excluded}\tNA\tNA\tNA",
+                    path.display()
+                );
+                continue;
+            };
+            assert_eq!(summary.count, counts.combinations[0]);
             eprintln!(
                 "{}\t{channel}\t{method}\t{}\t{excluded}\t{:.6}\t{:.6}\t{:.6}",
                 path.display(),
@@ -196,12 +214,41 @@ fn report_sample(path: &Path) {
     }
 }
 
+fn report_native_counts(path: &Path, channel: usize, layer: &Layer) {
+    let mut counts = Counts::default();
+    for &causes in layer.influence.as_ref().unwrap() {
+        counts.record(causes);
+    }
+    report_counts(path, channel, "native-full-plane", &counts);
+}
+
+fn report_counts(path: &Path, channel: usize, scope: &str, counts: &Counts) {
+    eprintln!(
+        "causes\t{}\t{channel}\t{scope}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:?}",
+        path.display(),
+        counts.combinations[0],
+        counts.excluded(),
+        counts.containing(BAD_PIXEL),
+        counts.containing(AF_PIXEL),
+        counts.containing(ENCODED_MAXIMUM),
+        counts.containing(REPAIR_CLIPPED_DONOR),
+        counts.overlapping(),
+        counts.combinations,
+    );
+}
+
 #[test]
 #[ignore = "requires X3F_SAMPLE_DIR containing the six supported sd Quattro corpus files; reports diagnostics, not calibrated accuracy"]
 fn sd_quattro_corpus_reports_native_layer_residuals() {
     let root =
         std::path::PathBuf::from(std::env::var_os("X3F_SAMPLE_DIR").expect("X3F_SAMPLE_DIR"));
     eprintln!("sample\tlayer\tmethod\taccepted\texcluded\tbias_codes\trms_codes\tp95_abs_codes");
+    eprintln!(
+        "# causes columns: kind, sample, layer, scope, clear, flagged, bad_pixel, af_pixel, encoded_maximum, repair_clipped_donor, multi_cause, exact_combinations[0..15]"
+    );
+    eprintln!(
+        "# cause bits: bad_pixel=1, af_pixel=2, encoded_maximum=4, repair_clipped_donor=8; marginal counts overlap; combination 0 is clear; native scope includes dark shields; projected scope uses the common support union"
+    );
     for relative in [
         "20220305-of_intermedio_ritratto-001.x3f",
         "20220305-of_intermedio_ritratto-002.x3f",
@@ -237,8 +284,8 @@ fn projection_preserves_constant_native_signal() {
     }
     .sample(6, 6);
     assert_eq!(
-        (sample.bilinear, sample.guided, sample.excluded),
-        (0.75, 0.75, false)
+        (sample.bilinear, sample.guided, sample.causes),
+        (0.75, 0.75, 0)
     );
 }
 
@@ -279,7 +326,7 @@ fn flat_guide_spreads_native_impulse_across_regression_window() {
     .sample(6, 6);
     assert!((sample.bilinear - 0.640625).abs() < 1e-6);
     assert!((sample.guided - 0.51).abs() < 1e-6);
-    assert!(!sample.excluded);
+    assert_eq!(sample.causes, 0);
 }
 
 #[test]
@@ -294,8 +341,8 @@ fn projection_excludes_indirect_regression_support() {
         top: &top,
         regression: &regression,
     };
-    assert!(projection.sample(6, 6).excluded);
-    assert!(!projection.sample(9, 9).excluded);
+    assert_eq!(projection.sample(6, 6).causes, BAD_PIXEL);
+    assert_eq!(projection.sample(9, 9).causes, 0);
 }
 
 #[test]
@@ -304,9 +351,125 @@ fn residual_summary_uses_signed_bias_and_nearest_rank_percentile() {
     for value in [1.0, -2.0, 3.0, -4.0] {
         residuals.record(0.0, value, 2.0);
     }
-    let summary = residuals.summarize();
+    let summary = residuals.summarize().unwrap();
     assert_eq!(summary.count, 4);
     assert_eq!(summary.bias, -1.0);
     assert_eq!(summary.rms, 30.0f64.sqrt());
     assert_eq!(summary.p95, 8.0);
+}
+
+#[test]
+fn repair_cause_tracks_only_clipped_donors_in_the_selected_ring() {
+    let defects = [0, 0, BAD_PIXEL | AF_PIXEL, 0, 0];
+    for (samples, expected_center) in [
+        ([9, 7, 9, 7, 9], BAD_PIXEL | AF_PIXEL),
+        ([9, 9, 9, 7, 9], BAD_PIXEL | AF_PIXEL | REPAIR_CLIPPED_DONOR),
+    ] {
+        let clipping = super::source_clipping_mask(&samples, 9, &defects).unwrap();
+        let mut layer = constant_layer(5, 1, 0.5);
+        layer.influence = Some(clipping.clone());
+        super::repair_pixels(&mut layer, &defects).unwrap();
+        let flags = layer.influence.as_mut().unwrap();
+        attribute_sources(&defects, &clipping, flags);
+        assert_eq!(flags[2], expected_center);
+        assert_eq!(flags[0], ENCODED_MAXIMUM);
+        assert_eq!(flags[4], ENCODED_MAXIMUM);
+        assert_eq!(layer.pixels, [0.5; 5]);
+    }
+}
+
+#[test]
+fn cause_propagation_preserves_binary_eligibility_and_reconstruction_values() {
+    let mut source = constant_layer(12, 12, 0.5);
+    source.pixels[6 * 12 + 6] = 0.75;
+    source.influence.as_mut().unwrap()[4 * 12 + 4] = BAD_PIXEL;
+    source.influence.as_mut().unwrap()[6 * 12 + 5] = BAD_PIXEL | REPAIR_CLIPPED_DONOR;
+    let mut top = constant_layer(24, 24, 0.5);
+    top.pixels[12 * 24 + 12] = 0.8;
+    top.influence.as_mut().unwrap()[8 * 24 + 8] = AF_PIXEL;
+    top.influence.as_mut().unwrap()[12 * 24 + 12] = ENCODED_MAXIMUM;
+    let binary_source = Layer {
+        width: source.width,
+        height: source.height,
+        pixels: source.pixels.clone(),
+        noise_variance: source.noise_variance,
+        influence: Some(
+            source
+                .influence
+                .as_ref()
+                .unwrap()
+                .iter()
+                .map(|&flags| u8::from(flags != 0))
+                .collect(),
+        ),
+    };
+    let binary_top = Layer {
+        width: top.width,
+        height: top.height,
+        pixels: top.pixels.clone(),
+        noise_variance: top.noise_variance,
+        influence: Some(
+            top.influence
+                .as_ref()
+                .unwrap()
+                .iter()
+                .map(|&flags| u8::from(flags != 0))
+                .collect(),
+        ),
+    };
+    let guide = downsample(&top).unwrap();
+    let binary_guide = downsample(&binary_top).unwrap();
+    let regression = local_regression(&guide, &source).unwrap();
+    let binary_regression = local_regression(&binary_guide, &binary_source).unwrap();
+    assert_eq!(guide.pixels, binary_guide.pixels);
+    assert_eq!(regression.coefficients, binary_regression.coefficients);
+    let projection = Projection {
+        source: &source,
+        top: &top,
+        regression: &regression,
+    };
+    let binary_projection = Projection {
+        source: &binary_source,
+        top: &binary_top,
+        regression: &binary_regression,
+    };
+    assert_eq!(
+        projection.sample(6, 6).causes,
+        BAD_PIXEL | AF_PIXEL | ENCODED_MAXIMUM | REPAIR_CLIPPED_DONOR
+    );
+    for y in 3..9 {
+        for x in 3..9 {
+            let tagged = projection.sample(x, y);
+            let binary = binary_projection.sample(x, y);
+            assert_eq!(tagged.bilinear.to_bits(), binary.bilinear.to_bits());
+            assert_eq!(tagged.guided.to_bits(), binary.guided.to_bits());
+            assert_eq!(tagged.causes != 0, binary.causes != 0);
+        }
+    }
+}
+
+#[test]
+fn fully_excluded_population_has_counts_without_residual_statistics() {
+    let mut source = constant_layer(8, 8, 0.5);
+    source.influence.as_mut().unwrap().fill(AF_PIXEL);
+    let top = constant_layer(16, 16, 0.5);
+    let guide = downsample(&top).unwrap();
+    let regression = local_regression(&guide, &source).unwrap();
+    let projection = Projection {
+        source: &source,
+        top: &top,
+        regression: &regression,
+    };
+    let crop = Crop {
+        left: 0,
+        top: 0,
+        right: 15,
+        bottom: 15,
+    };
+    let (counts, summaries) = measure_projection(&projection, crop, 1.0);
+    assert_eq!(counts.combinations[0], 0);
+    assert_eq!(counts.excluded(), 4);
+    assert_eq!(counts.containing(AF_PIXEL), 4);
+    assert_eq!(counts.overlapping(), 0);
+    assert!(summaries.iter().all(Option::is_none));
 }

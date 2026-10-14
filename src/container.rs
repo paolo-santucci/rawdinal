@@ -12,6 +12,10 @@ use crate::{
 const MAX_FILE_BYTES: usize = 512 * 1024 * 1024;
 const MAX_PLANE_SAMPLES: usize = 32 * 1024 * 1024;
 
+/// A parsed X3F container with RAW and CAMF sections.
+///
+/// Parsing permits metadata access for selected legacy layouts. It does not imply
+/// sensor-decoding support; use [`Self::decode`] to decode supported physical planes.
 pub struct X3f<'a> {
     raw: Reader<'a>,
     camf: Reader<'a>,
@@ -47,6 +51,10 @@ pub struct SensorImage {
 }
 
 impl<'a> X3f<'a> {
+    /// Validates section bounds and retains RAW, CAMF and optional JPEG data.
+    ///
+    /// X3F 2.1 and 2.2 are accepted for legacy metadata access alongside the
+    /// supported sensor container versions. Legacy RAW type 3 remains undecodable.
     pub fn parse(bytes: &'a [u8]) -> Result<Self> {
         if !(44..=MAX_FILE_BYTES).contains(&bytes.len()) {
             return Err(invalid("file size outside supported limits"));
@@ -56,7 +64,13 @@ impl<'a> X3f<'a> {
         let version = file.u32(4)?;
         if !matches!(
             version,
-            0x0002_0003 | 0x0003_0000 | 0x0003_0001 | 0x0004_0001 | 0x0004_0002
+            0x0002_0001
+                | 0x0002_0002
+                | 0x0002_0003
+                | 0x0003_0000
+                | 0x0003_0001
+                | 0x0004_0001
+                | 0x0004_0002
         ) {
             return Err(invalid("unsupported X3F version"));
         }
@@ -97,14 +111,18 @@ impl<'a> X3f<'a> {
             match directory.bytes(entry + 8, 4)? {
                 b"IMA2" => {
                     section.signature(0, b"SECi")?;
-                    if section.u32(8)? == 1 && raw.replace(section).is_some() {
+                    if matches!(section.u32(8)?, 1 | 3) && raw.replace(section).is_some() {
                         return Err(invalid("multiple RAW sections"));
                     }
                     if section.u32(8)? == 2 && section.u32(12)? == 0x12 {
                         section.bytes(0, 28)?;
-                        if jpeg.is_none() {
-                            jpeg = Some(Reader(&section.0[28..]));
-                        }
+                        jpeg.get_or_insert(Reader(&section.0[28..]));
+                    }
+                }
+                b"IMAG" if matches!(version, 0x0002_0001 | 0x0002_0002) => {
+                    section.signature(0, b"SECi")?;
+                    if section.u32(8)? == 3 && raw.replace(section).is_some() {
+                        return Err(invalid("multiple RAW sections"));
                     }
                 }
                 b"CAMF" => {
@@ -126,11 +144,18 @@ impl<'a> X3f<'a> {
         })
     }
 
+    /// Extracts CAMF and parses its text, properties and numeric matrices.
+    ///
+    /// Also supports CAMF type 2 for X3F 2.1/2.2 with RAW type 3 / format 6.
+    /// Successful metadata parsing does not establish calibration-table semantics.
     pub fn calibration(&self) -> Result<Calibration> {
         Calibration::decode(self.validated_camf()?)
     }
 
     pub fn sensor_format(&self) -> Result<SensorFormat> {
+        if self.raw.u32(8)? != 1 {
+            return Err(invalid("unsupported RAW image type"));
+        }
         match (self.version, self.raw.u32(12)?) {
             (0x0002_0003 | 0x0003_0000 | 0x0003_0001, 0x1e) => Ok(SensorFormat::Merrill),
             (0x0004_0001, 0x23) => Ok(SensorFormat::Quattro),
@@ -141,7 +166,13 @@ impl<'a> X3f<'a> {
         }
     }
 
-    /// Decompresses the CAMF payload without interpreting its entries.
+    /// Extracts the CAMF payload without interpreting its entries.
+    ///
+    /// Decrypts type 2 for X3F 2.1/2.2 with RAW type 3 / format 6, or decompresses
+    /// type 4/5 for supported sensor formats. Type 2 uses the directory section
+    /// length and returns only original payload bytes, without synthetic padding.
+    /// Extracted bytes are not authenticated; use [`Self::calibration`] to validate
+    /// entry structure.
     pub fn camf_bytes(&self) -> Result<Vec<u8>> {
         crate::camf::decompress(self.validated_camf()?)
     }
@@ -260,9 +291,12 @@ impl<'a> X3f<'a> {
     }
 
     fn validated_camf(&self) -> Result<Reader<'a>> {
-        let expected_type = match self.sensor_format()? {
-            SensorFormat::Merrill => 4,
-            SensorFormat::Quattro | SensorFormat::SdQuattro => 5,
+        let expected_type = match (self.version, self.raw.u32(8)?, self.raw.u32(12)?) {
+            (0x0002_0001 | 0x0002_0002, 3, 6) => 2,
+            _ => match self.sensor_format()? {
+                SensorFormat::Merrill => 4,
+                SensorFormat::Quattro | SensorFormat::SdQuattro => 5,
+            },
         };
         if self.camf.u32(8)? != expected_type {
             return Err(invalid("unsupported CAMF type for sensor format"));
